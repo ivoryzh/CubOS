@@ -682,7 +682,7 @@ def test_movement_reconnect_mapping_uses_structured_error_attribute(monkeypatch)
     [
         ("POST", "/api/v1/gantry/feed-hold", "feed_hold", None),
         ("POST", "/api/v1/gantry/resume", "resume", None),
-        ("POST", "/api/v1/gantry/jog-cancel", "jog_cancel", None),
+        ("POST", "/api/v1/gantry/jog-cancel", "jog_cancel_interrupt", None),
         ("POST", "/api/v1/gantry/unlock", "unlock", None),
         ("POST", "/api/v1/gantry/reset-unlock", "reset_and_unlock", None),
         (
@@ -821,6 +821,31 @@ def test_calibration_and_recovery_endpoints_delegate_to_session(monkeypatch):
     assert "restore_calibration_soft_limits" in called
     assert "finalize_calibration_origin" in called
     assert "recover_calibration_limit" in called
+
+
+def test_limit_recovery_connection_loss_maps_to_503(monkeypatch):
+    from cubos.gantry.gantry_driver.exceptions import MillConnectionError
+
+    session = FakeSession()
+
+    def fail(**_kwargs):
+        raise MillConnectionError(
+            "Controller connection lost and serial reconnect failed after 4 attempts"
+        )
+
+    session.recover_calibration_limit = fail
+    monkeypatch.setattr(gantry_router, "_session", session)
+
+    response = api_request(
+        create_app(),
+        "POST",
+        "/api/v1/gantry/calibration/recover-limit",
+        json={"x": 1, "y": 0, "z": 0},
+    )
+
+    assert response.status_code == 503
+    assert "Controller connection lost" in response.text
+    assert "Power-cycle" in response.text
 
 
 def test_limit_recovery_alarm_error_maps_to_409(monkeypatch):
@@ -965,7 +990,7 @@ def test_advanced_gantry_actions_delegate_to_session(monkeypatch):
     assert "reset_and_unlock" in called
     assert "feed_hold" in called
     assert "resume" in called
-    assert "jog_cancel" in called
+    assert "jog_cancel_interrupt" in called
     assert "read_grbl_settings" in called
     assert ("set_grbl_setting", ("$20", "0")) in session.calls
 
@@ -1065,6 +1090,31 @@ def test_reset_session_clears_module_global(monkeypatch):
     gantry_router.reset_session()
 
     assert gantry_router.current_session() is None
+
+
+def test_blocking_jog_passes_explicit_slow_feed_rate(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(gantry_router, "_session", session)
+    response = api_request(create_app(), "POST", "/api/v1/gantry/jog-blocking", json={"y": 0.25, "feed_rate": 100})
+    assert response.status_code == 200
+    assert ("jog_blocking", {"x": 0, "y": 0.25, "z": 0, "timeout_s": 10, "feed_rate": 100}) in session.calls
+
+
+@pytest.mark.parametrize("feed_rate", [0, -1, 2001])
+def test_blocking_jog_rejects_unsafe_feed_rates(monkeypatch, feed_rate):
+    session = FakeSession()
+    monkeypatch.setattr(gantry_router, "_session", session)
+    response = api_request(create_app(), "POST", "/api/v1/gantry/jog-blocking", json={"y": 0.25, "feed_rate": feed_rate})
+    assert response.status_code == 422
+    assert session.calls == []
+
+
+def test_blocking_jog_rejects_nan_feed_rate(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(gantry_router, "_session", session)
+    response = api_request(create_app(), "POST", "/api/v1/gantry/jog-blocking", content='{"y":0.25,"feed_rate":NaN}', headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    assert session.calls == []
 
 
 def test_motion_and_calibration_endpoints_reject_while_run_active(monkeypatch):
@@ -1207,3 +1257,48 @@ def test_instrument_methods_use_public_measurement_method_api(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"demo": ["measure"]}
     assert calls == ["demo"]
+
+
+def test_delete_gantry_removes_file_and_404s_when_missing(monkeypatch, tmp_path):
+    config_dir = tmp_path / "configs"
+    gantry_dir = config_dir / "gantry"
+    gantry_dir.mkdir(parents=True)
+    (gantry_dir / "old.yaml").write_text("working_volume: {}\n", encoding="utf-8")
+    monkeypatch.setattr(get_settings(), "config_dir", config_dir)
+    monkeypatch.setattr(gantry_router, "_session", None)
+    app = create_app()
+
+    response = api_request(app, "DELETE", "/api/v1/gantry/old.yaml")
+    assert response.status_code == 200
+    assert response.json() == {"status": "deleted", "filename": "old.yaml"}
+    assert not (gantry_dir / "old.yaml").exists()
+    assert api_request(app, "DELETE", "/api/v1/gantry/old.yaml").status_code == 404
+
+
+def test_delete_gantry_refused_for_connected_config(monkeypatch, tmp_path):
+    config_dir = tmp_path / "configs"
+    gantry_dir = config_dir / "gantry"
+    gantry_dir.mkdir(parents=True)
+    (gantry_dir / "live.yaml").write_text("working_volume: {}\n", encoding="utf-8")
+    monkeypatch.setattr(get_settings(), "config_dir", config_dir)
+    monkeypatch.setattr(
+        gantry_router,
+        "_session",
+        SimpleNamespace(connected_gantry_filename="live.yaml"),
+    )
+
+    response = api_request(create_app(), "DELETE", "/api/v1/gantry/live.yaml")
+    assert response.status_code == 409
+    assert "disconnect" in response.json()["detail"]
+    assert (gantry_dir / "live.yaml").exists()
+
+
+def test_cancelled_correlated_blocking_jog_is_not_http_success(monkeypatch):
+    from cubos.gantry.session import GantryJogCancelledError
+
+    session = FakeSession()
+    session.jog_blocking = MagicMock(side_effect=GantryJogCancelledError("Calibration jog was cancelled before completion."))
+    monkeypatch.setattr(gantry_router, "_session", session)
+    response = api_request(create_app(), "POST", "/api/v1/gantry/jog-blocking", json={"z": 1, "jog_id": "cancelled-step"})
+    assert response.status_code == 409
+    assert "cancelled" in response.json()["detail"]

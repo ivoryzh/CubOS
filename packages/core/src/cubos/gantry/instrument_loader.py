@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import inspect
+import logging
 from pathlib import Path
 from typing import Any, Dict, Mapping, TYPE_CHECKING
 
@@ -17,6 +18,16 @@ from .instrument_mount import InstrumentedGantry
 
 if TYPE_CHECKING:
     from cubos.gantry import Gantry
+
+logger = logging.getLogger(__name__)
+
+# Removed YAML fields still present in deployed configs: dropped with a
+# warning instead of failing the load. Keyed by instrument type.
+_RETIRED_INSTRUMENT_FIELDS: dict[str, dict[str, str]] = {
+    "capper": {
+        "park_position": "decap/cap no longer park; delete this key",
+    },
+}
 
 
 def _format_loader_exception(path: Path, error: Exception) -> str:
@@ -69,12 +80,23 @@ def _instantiate_instruments(
         type_key = kwargs.pop("type")
         vendor = kwargs.pop("vendor")
         validate_instrument(type_key, vendor)
+        _drop_retired_fields(name, type_key, kwargs)
         if mock_mode:
             kwargs["offline"] = True
         cls = get_instrument_class(type_key, vendor)
         _validate_driver_kwargs(name, type_key, vendor, cls, kwargs)
         instruments[name] = cls(**kwargs)
     return instruments
+
+
+def _drop_retired_fields(name: str, type_key: str, kwargs: Dict[str, Any]) -> None:
+    for field, reason in _RETIRED_INSTRUMENT_FIELDS.get(type_key, {}).items():
+        if field in kwargs:
+            kwargs.pop(field)
+            logger.warning(
+                "Instrument '%s' (%s): YAML field '%s' is no longer used and "
+                "was ignored (%s).", name, type_key, field, reason,
+            )
 
 
 def _validate_driver_kwargs(
@@ -115,6 +137,7 @@ def build_instrumented_gantry(
     expected_grbl_settings: dict[str, float] | None = None,
     mock_mode: bool = False,
     safe_z: float | None = None,
+    motion_envelopes: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> InstrumentedGantry:
     """Build an InstrumentedGantry from parsed instrument config entries."""
     return InstrumentedGantry(
@@ -125,6 +148,7 @@ def build_instrumented_gantry(
         ),
         expected_grbl_settings=expected_grbl_settings,
         safe_z=safe_z,
+        motion_envelopes=motion_envelopes,
     )
 
 
@@ -142,12 +166,14 @@ def load_instrumented_gantry_from_config(
         )
     expected_grbl_settings = getattr(config, "expected_grbl_settings", None)
     safe_z = getattr(config, "resolved_safe_z", None)
+    motion_envelopes = getattr(config, "motion_envelopes", None)
     return build_instrumented_gantry(
         instrument_configs,
         gantry,
         expected_grbl_settings=expected_grbl_settings,
         mock_mode=mock_mode,
         safe_z=safe_z,
+        motion_envelopes=motion_envelopes,
     )
 
 

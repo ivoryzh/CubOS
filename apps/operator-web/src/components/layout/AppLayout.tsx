@@ -1,31 +1,22 @@
 import type { ReactNode } from "react";
 import { card, chrome, color } from "../../theme";
+import "./AppLayout.css";
 
 interface Props {
+  banner?: ReactNode;
   header: ReactNode;
   left: ReactNode;
-  topRight: ReactNode;
+  topRight?: ReactNode;
   bottomRight: ReactNode;
 }
 
-export default function AppLayout({ header, left, topRight, bottomRight }: Props) {
+export default function AppLayout({ banner, header, left, topRight, bottomRight }: Props) {
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        height: "100vh",
-        background: color.canvas,
-      }}
-    >
+    <div className="operator-layout" style={{ background: color.canvas }}>
+      {banner}
       <header
+        className="operator-header"
         style={{
-          flex: "0 0 auto",
-          display: "flex",
-          alignItems: "center",
-          gap: 16,
-          minHeight: 56,
-          padding: "8px 16px",
           background: chrome.headerBg,
           borderBottom: `1px solid ${color.border}`,
           boxShadow: chrome.headerHairline,
@@ -33,51 +24,16 @@ export default function AppLayout({ header, left, topRight, bottomRight }: Props
       >
         {header}
       </header>
-      <div
-        style={{
-          flex: "1 1 auto",
-          minHeight: 0,
-          display: "grid",
-          gridTemplateColumns: "minmax(0, 3fr) minmax(0, 2fr)",
-          gridTemplateRows: "minmax(0, 1fr) auto",
-          gap: 14,
-          padding: 14,
-        }}
-      >
-        <section
-          style={{
-            ...card,
-            gridRow: "1 / 3",
-            gridColumn: "1",
-            overflow: "auto",
-            padding: 18,
-          }}
-        >
+      <div className={topRight ? "operator-workspace" : "operator-workspace operator-workspace--visualize"}>
+        <section className="operator-editor" style={card}>
           {left}
         </section>
-        <section
-          style={{
-            ...card,
-            gridRow: "1",
-            gridColumn: "2",
-            overflow: "hidden",
-            padding: 16,
-            minHeight: 0,
-            display: "flex",
-            flexDirection: "column",
-          }}
-        >
-          {topRight}
-        </section>
-        <section
-          style={{
-            ...card,
-            gridRow: "2",
-            gridColumn: "2",
-            padding: 16,
-            overflow: "hidden",
-          }}
-        >
+        {topRight && (
+          <section className="operator-preview" style={card}>
+            {topRight}
+          </section>
+        )}
+        <section className="operator-controls" style={card}>
           {bottomRight}
         </section>
       </div>

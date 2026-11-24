@@ -9,7 +9,7 @@ represented) lives entirely in ``vendors/<vendor>.py`` implementations --
 the protocol engine and this interface never branch on a machine name.
 
 Motion sequencing (approach at ``safe_z`` -> engage Z -> capture/release ->
-retract -> park) is owned by the protocol-engine ``decap``/``cap`` commands
+retract) is owned by the protocol-engine ``decap``/``cap`` commands
 (``cubos.protocol_engine.commands.capper``), built from the same generic
 gantry primitives every other instrument uses
 (``InstrumentedGantry.move_to_labware`` / ``.move``). This interface only
@@ -19,13 +19,16 @@ hardcoded in the protocol commands:
 * ``engage_depth_mm`` -- labware-relative Z offset (mm; typically negative)
   from the vial's calibrated rim reference the tool head descends to while
   capturing/releasing a cap.
-* ``park_position`` -- ``(x, y)`` deck-frame position the tool retreats to
-  after every decap/cap action, so a loaded or freshly-released cap is never
-  left hovering over open labware.
 * ``capture_retries`` -- number of additional actuate-then-sense attempts
   before failing closed.
 * ``capture_settle_s`` -- seconds to wait after actuation before reading the
   sensor.
+* ``release_overtravel_mm`` -- additional downward travel used only while
+  releasing a cap, so seating pressure can overcome residual attraction.
+* ``cap_release_shimmy_y_mm`` -- Y sweep amplitude used only when a capping
+  attempt fails its post-retract sensor check. The recovery retry moves from
+  centre to ``+amplitude``, then ``-amplitude``, then centre at the same Z
+  before retracting and checking again.
 """
 
 from __future__ import annotations
@@ -46,9 +49,10 @@ class CapperInstrument(BaseInstrument):
         self,
         *,
         engage_depth_mm: float,
-        park_position: tuple,
         capture_retries: int = 2,
         capture_settle_s: float = 1.0,
+        release_overtravel_mm: float = 0.0,
+        cap_release_shimmy_y_mm: float = 0.0,
         name: Optional[str] = None,
         offset_x: float = 0.0,
         offset_y: float = 0.0,
@@ -60,10 +64,15 @@ class CapperInstrument(BaseInstrument):
             depth=depth, offline=offline,
         )
         self.engage_depth_mm = _finite_number(engage_depth_mm, "engage_depth_mm")
-        self.park_position = _finite_xy(park_position, "park_position")
         self.capture_retries = _nonnegative_int(capture_retries, "capture_retries")
         self.capture_settle_s = _finite_nonnegative(
             capture_settle_s, "capture_settle_s",
+        )
+        self.release_overtravel_mm = _finite_nonnegative(
+            release_overtravel_mm, "release_overtravel_mm",
+        )
+        self.cap_release_shimmy_y_mm = _finite_number(
+            cap_release_shimmy_y_mm, "cap_release_shimmy_y_mm",
         )
 
     @abstractmethod
@@ -107,15 +116,3 @@ def _nonnegative_int(value, field_name: str) -> int:
         )
     return value
 
-
-def _finite_xy(value, field_name: str) -> tuple:
-    if (
-        not isinstance(value, (tuple, list))
-        or len(value) != 2
-    ):
-        raise CapperConfigError(
-            f"{field_name} must be an (x, y) pair, got {value!r}."
-        )
-    x = _finite_number(value[0], f"{field_name}[0]")
-    y = _finite_number(value[1], f"{field_name}[1]")
-    return (x, y)

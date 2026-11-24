@@ -9,7 +9,7 @@ no setup and no external database server required.
 By default, results are written to:
 
 ```text
-data/databases/panda_data.db
+~/.cubos/panda_data.db
 ```
 
 Set `CUBOS_DATA_DB_PATH` to write a run to a different file. After a
@@ -33,6 +33,28 @@ successful run, analysis-friendly CSV exports are also written under
 `scan` stores one experiment row per well, `measure` one row for the target
 position, and pipette `transfer` updates labware contents.
 
+## Download Data ZIP
+
+**Results → Download Data** in the Operator UI, or
+`GET /api/v1/data/campaigns/<id>/data.zip`, gives one ZIP per campaign:
+
+| File | Contents |
+| --- | --- |
+| `README.txt` | What every file and column means, written for this campaign. |
+| `samples.csv` | One row per well: what was dispensed into it and how many measurements each instrument took. |
+| `<instrument>/measurements.csv` | One row per measurement: instrument settings and recorded values. |
+| `<instrument>/curves.csv` | One row per recorded data point (long format), ready to plot by well. |
+| `uvvis/spectra_wide.csv` | Wavelength rows, one column per spectrum (`<well> <time>`). |
+| `asmi/raw/` | The original per-well ASMI CSVs and `metadata.csv`, for existing scripts. |
+| `camera/images/` | The captured image files. |
+| `metadata.json` | Campaign details, CubOS version, and analysis settings. |
+
+The ZIP holds raw data only: exactly what CubOS recorded, reshaped into plain
+CSVs. It does no fitting or analysis (no stiffness, modulus, peaks, or
+absorbance); do that in your own analysis tool from `curves.csv`. Every
+`measurements.csv` has `well_id`, `measured_at` (UTC) and `elapsed_min`
+(minutes since the campaign's first measurement) for time-series plots.
+
 ## CSV Export
 
 Export helpers require pandas:
@@ -43,8 +65,11 @@ pip install pandas
 
 List experiment IDs for a campaign:
 
+Omit `--db-path` to read the runtime database selected by `CUBOS_DATA_DB_PATH`
+or, when unset, `~/.cubos/panda_data.db`. An explicit `--db-path` takes precedence.
+
 ```bash
-python -m data.export_helpers \
+python -m cubos.data.export_helpers \
   --db-path runs/example.db \
   campaign-experiments 1 \
   --csv runs/campaign_1_experiments.csv
@@ -53,16 +78,21 @@ python -m data.export_helpers \
 Export all measurements for one experiment:
 
 ```bash
-python -m data.export_helpers \
+python -m cubos.data.export_helpers \
   --db-path runs/example.db \
   experiment-all 42 \
   --csv runs/experiment_42_measurements.csv
 ```
 
+The `data_json` column contains each measurement's payload. Stored measurement
+arrays become JSON arrays; text metadata such as device IDs, image paths, and
+stop reasons stays text, even when it looks like JSON (`"123"` or `"null"`).
+The same rule applies to `DataReader.get_experiment_measurements_dataframe()`.
+
 Export one supported instrument table for an experiment:
 
 ```bash
-python -m data.export_helpers \
+python -m cubos.data.export_helpers \
   --db-path runs/example.db \
   experiment-instrument 42 asmi \
   --csv runs/experiment_42_asmi.csv
@@ -70,5 +100,5 @@ python -m data.export_helpers \
 
 If `--csv` is omitted, the helper prints the table to stdout.
 
-For programmatic access — Python read/write APIs and ZIP exports — see the
+For programmatic access — Python read/write APIs and `export_campaign_data_zip` — see the
 [data API reference](reference/cubos/data/index.md).

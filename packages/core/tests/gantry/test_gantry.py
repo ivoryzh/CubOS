@@ -30,6 +30,22 @@ class TestGantry(unittest.TestCase):
         mock_mill.connect.assert_called_with(port="/dev/tty.usbserial-130")
 
     @patch("cubos.gantry.gantry.Mill")
+    def test_connect_leaves_default_feed_rate_unset_without_config(self, mock_mill_cls):
+        mock_mill = mock_mill_cls.return_value
+        mock_mill.default_feed_rate = 3000
+        gantry = Gantry(config=self.config)
+        gantry.connect()
+        self.assertEqual(mock_mill.default_feed_rate, 3000)
+
+    @patch("cubos.gantry.gantry.Mill")
+    def test_connect_applies_configured_default_feed_rate(self, mock_mill_cls):
+        mock_mill = mock_mill_cls.return_value
+        config = {**self.config, "cnc": {"default_feed_rate_mm_min": 4000.0}}
+        gantry = Gantry(config=config)
+        gantry.connect()
+        self.assertEqual(mock_mill.default_feed_rate, 4000.0)
+
+    @patch("cubos.gantry.gantry.Mill")
     def test_move_delegates_to_mill_move_to(self, mock_mill_cls):
         mock_mill = mock_mill_cls.return_value
         gantry = Gantry(config=self.config)
@@ -380,6 +396,24 @@ class TestGantry(unittest.TestCase):
         mock_mill.set_grbl_setting.assert_called_once_with("20", "0")
 
     @patch("cubos.gantry.gantry.Mill")
+    def test_hard_limits_enabled_reads_dollar21(self, mock_mill_cls):
+        mock_mill = mock_mill_cls.return_value
+        mock_mill.read_grbl_settings.return_value = {"$21": "0"}
+        gantry = Gantry(config=self.config)
+        self.assertFalse(gantry.hard_limits_enabled())
+        mock_mill.read_grbl_settings.return_value = {}
+        self.assertIsNone(gantry.hard_limits_enabled())
+        mock_mill.read_grbl_settings.return_value = {"$21": "not-a-number"}
+        self.assertIsNone(gantry.hard_limits_enabled())
+
+    @patch("cubos.gantry.gantry.Mill")
+    def test_set_hard_limits_enabled_delegates_to_grbl_setting(self, mock_mill_cls):
+        mock_mill = mock_mill_cls.return_value
+        gantry = Gantry(config=self.config)
+        gantry.set_hard_limits_enabled(True)
+        mock_mill.set_grbl_setting.assert_called_once_with("21", "1")
+
+    @patch("cubos.gantry.gantry.Mill")
     def test_configure_soft_limits_writes_and_verifies_settings(self, mock_mill_cls):
         mock_mill = mock_mill_cls.return_value
         mock_mill.read_grbl_settings.return_value = {
@@ -494,7 +528,7 @@ class TestGantryFinalizeDeckOriginCalibration(unittest.TestCase):
             {"x": 396.0, "y": 260.5, "z": 101.0},
         )
         self.assertEqual(result["homing_pull_off_mm"], 10.0)
-        self.assertEqual(mock_mill.home.call_count, 1)
+        self.assertEqual(mock_mill.home.call_count, 2)
         mock_mill.execute_command.assert_any_call(
             "G10 L20 P1 X386 Y250.5 Z91"
         )

@@ -455,6 +455,8 @@ def begin_fluid_mix(
     speed: float,
     height: float = 0.0,
     campaign_id: int | None = None,
+    *,
+    blowout_height: float | None = None,
 ) -> bool:
     """Preflight and journal a net-zero mix before physical actuation."""
     _validate_operation_key(operation_key)
@@ -468,6 +470,8 @@ def begin_fluid_mix(
         "repetitions": repetitions,
         "speed": mix_speed,
     }
+    if blowout_height is not None:
+        parameters["blowout_height"] = _finite_number(blowout_height, "blowout_height")
 
     with _immediate_transaction(connection):
         _require_state(connection, fluid_state_id)
@@ -1070,7 +1074,11 @@ def _layout_entry(
             "width": _optional_float(labware.width),
             "height": _optional_float(labware.height),
             "well_depth": _optional_float(labware.well_depth),
-            "diameter": None,
+            # Read out of the open attribute bag, staying None when the
+            # plate does not record a diameter. This payload is a cross-repo
+            # contract consumed by Zoo, so no new keys are introduced
+            # alongside the populated one.
+            "diameter": labware.well_attribute_float("diameter"),
         }
         capacity_ul = float(labware.capacity_ul)
         working_volume_ul = float(labware.working_volume_ul)

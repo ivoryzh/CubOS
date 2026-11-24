@@ -1,6 +1,7 @@
 """Generic pipette instrument interface."""
 
 from abc import abstractmethod
+from typing import Any
 
 from cubos.instruments.base_instrument import BaseInstrument
 from cubos.instruments.pipette.liquid_class import (
@@ -12,7 +13,22 @@ from cubos.instruments.pipette.models import AspirateResult, MixResult, PipetteS
 
 
 class PipetteInstrument(BaseInstrument):
-    """Base class for pipette implementations."""
+    """Base class for pipette implementations.
+
+    Speed semantics
+    ---------------
+    Every ``speed`` argument below is a **normalized 0-100 percentage of the
+    instrument's usable speed range**, not a physical unit. Each driver maps
+    it onto whatever its hardware takes -- an index, steps per second, a
+    millimetres-per-second figure -- so a protocol stays portable across
+    vendors.
+
+    This contract was written once two vendors existed. ``OpentronsPipette``
+    still discards ``speed`` and lets its firmware pick a velocity (see the
+    ``TODO(iter)`` there); honoring it would change motion on machines
+    already in use, so that is a deliberate follow-up rather than part of
+    this contract's introduction.
+    """
 
     @property
     def liquid_classes(self) -> dict[str, LiquidClassCorrection]:
@@ -35,6 +51,11 @@ class PipetteInstrument(BaseInstrument):
                 f"Unknown liquid class {liquid_class!r}. Configured: "
                 f"{sorted(self.liquid_classes)}."
             ) from None
+
+    @property
+    def loaded_volume_ul(self) -> float | None:
+        """Driver-tracked liquid volume; None if the driver cannot determine it."""
+        return None
 
     @property
     @abstractmethod
@@ -69,14 +90,42 @@ class PipetteInstrument(BaseInstrument):
     def blowout(self, speed: float = 50.0) -> None:
         """Move the plunger to the blowout position."""
 
-    @abstractmethod
+    @property
+    def requires_home_after_blowout(self) -> bool:
+        """Whether protocols must retract clear of liquid before homing."""
+        return False
+
     def mix(
         self,
         volume_ul: float,
-        repetitions: int = 3,
+        cycles: int = 3,
         speed: float = 50.0,
+        *,
+        gantry: Any,
+        position: tuple[float, float, float],
+        lift_mm: float = 1.0,
     ) -> MixResult:
-        """Aspirate and dispense repeatedly to mix a liquid."""
+        """Mix by cycling the tip between two heights in the liquid.
+
+        ``position`` is the tip ``(x, y, z)`` at the measurement height,
+        which the caller has already engaged. Each cycle aspirates there,
+        rises ``lift_mm`` to dispense and aspirate again, then returns to
+        the measurement height to dispense. The protocol command owns the
+        final retraction and blowout above the sample.
+        """
+        if isinstance(cycles, bool) or not isinstance(cycles, int) or cycles <= 0:
+            raise ValueError(f"mix cycles must be a positive integer, got {cycles!r}.")
+        x, y, z = position
+        low = (x, y, z)
+        high = (x, y, z + lift_mm)
+        for _ in range(cycles):
+            self.aspirate(volume_ul, speed)
+            gantry.move(self, high)
+            self.dispense(volume_ul, speed)
+            self.aspirate(volume_ul, speed)
+            gantry.move(self, low)
+            self.dispense(volume_ul, speed)
+        return MixResult(success=True, volume_ul=volume_ul, cycles=cycles)
 
     @abstractmethod
     def pick_up_tip(self, speed: float = 50.0) -> None:

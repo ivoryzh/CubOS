@@ -10,7 +10,12 @@ project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 from cubos.gantry.coordinates import Coordinates
-from cubos.gantry.gantry_driver.driver import Mill, wpos_pattern, mpos_pattern
+from cubos.gantry.gantry_driver.driver import (
+    Mill,
+    looks_like_connection_loss,
+    mpos_pattern,
+    wpos_pattern,
+)
 from cubos.gantry.gantry_driver.exceptions import (
     CommandExecutionError,
     LocationNotFound,
@@ -42,6 +47,9 @@ class ScriptedSerial:
 
     def flush(self):
         pass
+
+    def reset_input_buffer(self):
+        self.lines.clear()
 
     def read_all(self):
         return b""
@@ -271,7 +279,8 @@ class TestCNCDriverLogic(unittest.TestCase):
         mill.ser_mill = FakeGrblSerial(jog_response="error:8")
 
         mill.jog()
-        mill.jog(x=1.0, z=-2.0)
+        with self.assertRaisesRegex(CommandExecutionError, "error:8"):
+            mill.jog(x=1.0, z=-2.0)
         mill.jog_cancel()
         mill.unlock()
         mill.soft_reset()
@@ -310,6 +319,97 @@ class TestCNCDriverLogic(unittest.TestCase):
         mill.ser_mill = FakeGrblSerial(chunks=["error:2\r\n"])
         with self.assertRaises(StatusReturnError):
             mill._collect_grbl_settings_response()
+
+    def test_looks_like_connection_loss_classifies_errors(self):
+        self.assertTrue(
+            looks_like_connection_loss(
+                CommandExecutionError("Unlock ($X) timed out waiting for ok")
+            )
+        )
+        self.assertTrue(
+            looks_like_connection_loss(OSError(6, "Device not configured"))
+        )
+        self.assertFalse(looks_like_connection_loss(CommandExecutionError("error:9")))
+        self.assertFalse(looks_like_connection_loss("ALARM:1"))
+
+    @patch('cubos.gantry.gantry_driver.driver.time.sleep')
+    @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_command_logger')
+    def test_soft_reset_and_unlock_does_not_reconnect_when_link_dies(
+        self, mock_cmd_logger, mock_mill_logger, mock_serial, mock_sleep,
+    ):
+        mill = Mill()
+        failure = MillConnectionError("USB disconnected")
+        mill.soft_reset = MagicMock()
+        mill.unlock = MagicMock(side_effect=failure)
+        mill.reconnect = MagicMock()
+
+        with self.assertRaises(MillConnectionError) as caught:
+            mill.soft_reset_and_unlock()
+
+        self.assertIs(caught.exception, failure)
+        mill.soft_reset.assert_called_once()
+        mill.unlock.assert_called_once()
+        mill.reconnect.assert_not_called()
+
+    @patch('cubos.gantry.gantry_driver.driver.time.sleep')
+    @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_command_logger')
+    def test_reconnect_prefers_same_port_then_succeeds(
+        self, mock_cmd_logger, mock_mill_logger, mock_serial, mock_sleep,
+    ):
+        mill = Mill()
+        mill.ser_mill = FakeGrblSerial(port="/dev/cu.usbserial-130")
+
+        with patch.object(
+            Mill,
+            "connect",
+            side_effect=[MillConnectionError("device not yet enumerated"), None],
+        ) as mock_connect:
+            mill.reconnect(attempts=3, delay_s=0.0)
+
+        self.assertEqual(mock_connect.call_count, 2)
+        mock_connect.assert_any_call(port="/dev/cu.usbserial-130")
+
+    @patch('cubos.gantry.gantry_driver.driver.time.sleep')
+    @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_command_logger')
+    def test_reconnect_raises_after_exhausting_attempts(
+        self, mock_cmd_logger, mock_mill_logger, mock_serial, mock_sleep,
+    ):
+        mill = Mill()
+        mill.ser_mill = FakeGrblSerial(port="/dev/cu.usbserial-130")
+
+        with patch.object(
+            Mill,
+            "connect",
+            side_effect=MillConnectionError("device not yet enumerated"),
+        ) as mock_connect:
+            with self.assertRaises(MillConnectionError) as ctx:
+                mill.reconnect(attempts=2, delay_s=0.0)
+
+        self.assertEqual(mock_connect.call_count, 2)
+        self.assertIn("reconnect failed", str(ctx.exception))
+        # Final attempt falls back to auto-scan in case the name changed.
+        mock_connect.assert_called_with(port=None)
+
+    @patch('cubos.gantry.gantry_driver.driver.time.sleep')
+    @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_command_logger')
+    def test_seed_wco_polls_status_until_wco_reported(
+        self, mock_cmd_logger, mock_mill_logger, mock_serial, mock_sleep,
+    ):
+        mill = Mill()
+        mill.ser_mill = FakeGrblSerial(
+            chunks=["<Idle|WPos:1.0,2.0,3.0|WCO:4.0,5.0,6.0>\r\n"]
+        )
+        mill.seed_wco()
+        self.assertIn(b"?", mill.ser_mill.writes)
+        self.assertIsNotNone(mill._wco)
 
     @patch('cubos.gantry.gantry_driver.driver.time.sleep')
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
@@ -407,12 +507,26 @@ class TestCNCDriverLogic(unittest.TestCase):
         commands = mill._build_direct_move(current, target)
 
         self.assertEqual(commands, [
-            "G01 X10.0 F2000",
-            "G01 Y20.0 F2000",
-            "G01 Z-5.0 F2000",
+            "G01 X10.0 F3000",
+            "G01 Y20.0 F3000",
+            "G01 Z-5.0 F3000",
         ])
         # Regression guard: no combined-XY command anywhere.
         self.assertFalse(any("Y" in c and "X" in c for c in commands))
+
+    @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
+    @patch('cubos.gantry.gantry_driver.driver.set_up_command_logger')
+    def test_default_feed_rate_is_overridable_per_instance(self, mock_cmd_logger, mock_mill_logger, mock_serial):
+        """cnc.default_feed_rate_mm_min overrides the module default per Mill instance."""
+        mill = Mill()
+        mill.default_feed_rate = 4000
+
+        current = Coordinates(0.0, 0.0, 0.0)
+        target = Coordinates(10.0, 0.0, 0.0)
+        commands = mill._build_direct_move(current, target)
+
+        self.assertEqual(commands, ["G01 X10.0 F4000"])
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
     @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
@@ -425,7 +539,7 @@ class TestCNCDriverLogic(unittest.TestCase):
         target = Coordinates(10.0, 5.0, -5.0)  # only X changes
         commands = mill._build_direct_move(current, target)
 
-        self.assertEqual(commands, ["G01 X10.0 F2000"])
+        self.assertEqual(commands, ["G01 X10.0 F3000"])
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
     @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
@@ -445,9 +559,9 @@ class TestCNCDriverLogic(unittest.TestCase):
         commands = mill._build_transit_move(current, target, travel_z=-85.0)
 
         self.assertEqual(commands, [
-            "G01 Z-85.0 F2000",    # lift
-            "G01 X-110.0 F2000",   # X alone
-            "G01 Y-60.0 F2000",    # Y alone
+            "G01 Z-85.0 F3000",    # lift
+            "G01 X-110.0 F3000",   # X alone
+            "G01 Y-60.0 F3000",    # Y alone
             # target.z == travel_z, final descent skipped.
         ])
 
@@ -465,8 +579,8 @@ class TestCNCDriverLogic(unittest.TestCase):
         commands = mill._build_transit_move(current, target, travel_z=-85.0)
 
         self.assertEqual(commands, [
-            "G01 X-110.0 F2000",
-            "G01 Z-90.0 F2000",
+            "G01 X-110.0 F3000",
+            "G01 Z-90.0 F3000",
         ])
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
@@ -483,8 +597,8 @@ class TestCNCDriverLogic(unittest.TestCase):
         commands = mill._build_transit_move(current, target, travel_z=-85.0)
 
         self.assertEqual(commands, [
-            "G01 Z-85.0 F2000",
-            "G01 Z-90.0 F2000",
+            "G01 Z-85.0 F3000",
+            "G01 Z-90.0 F3000",
         ])
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
@@ -502,10 +616,10 @@ class TestCNCDriverLogic(unittest.TestCase):
         commands = mill._build_transit_move(current, target, travel_z=-85.0)
 
         self.assertEqual(commands, [
-            "G01 Z-85.0 F2000",    # lift
-            "G01 X-110.0 F2000",   # X alone
-            "G01 Y-60.0 F2000",    # Y alone
-            "G01 Z-90.0 F2000",    # descend
+            "G01 Z-85.0 F3000",    # lift
+            "G01 X-110.0 F3000",   # X alone
+            "G01 Y-60.0 F3000",    # Y alone
+            "G01 Z-90.0 F3000",    # descend
         ])
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
@@ -530,10 +644,10 @@ class TestCNCDriverLogic(unittest.TestCase):
 
         commands = [c[0][0] for c in mill.execute_command.call_args_list]
         self.assertEqual(commands, [
-            "G01 Z-5.0 F2000",     # lift first, unconditionally
-            "G01 X-110.0 F2000",
-            "G01 Y-60.0 F2000",
-            "G01 Z-90.0 F2000",
+            "G01 Z-5.0 F3000",     # lift first, unconditionally
+            "G01 X-110.0 F3000",
+            "G01 Y-60.0 F3000",
+            "G01 Z-90.0 F3000",
         ])
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
@@ -555,9 +669,9 @@ class TestCNCDriverLogic(unittest.TestCase):
             z_coordinate=-90.0,
         )
 
-        mill.execute_command.assert_any_call("G01 X-110.0 F2000")
-        mill.execute_command.assert_any_call("G01 Y-60.0 F2000")
-        mill.execute_command.assert_any_call("G01 Z-90.0 F2000")
+        mill.execute_command.assert_any_call("G01 X-110.0 F3000")
+        mill.execute_command.assert_any_call("G01 Y-60.0 F3000")
+        mill.execute_command.assert_any_call("G01 Z-90.0 F3000")
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
     @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
@@ -583,10 +697,10 @@ class TestCNCDriverLogic(unittest.TestCase):
         )
 
         self.assertEqual(sent, [
-            "G01 Z-85.0 F2000",
-            "G01 X-110.0 F2000",
-            "G01 Y-60.0 F2000",
-            "G01 Z-90.0 F2000",
+            "G01 Z-85.0 F3000",
+            "G01 X-110.0 F3000",
+            "G01 Y-60.0 F3000",
+            "G01 Z-90.0 F3000",
         ])
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
@@ -721,49 +835,44 @@ class TestCNCDriverLogic(unittest.TestCase):
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
     @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
     @patch('cubos.gantry.gantry_driver.driver.set_up_command_logger')
-    def test_home_retries_transient_status_failures(
+    def test_home_status_failure_propagates_without_retry(
         self, mock_cmd_logger, mock_mill_logger, mock_serial, mock_time, mock_sleep,
     ):
         mill = Mill()
+        mill.homed = True
         mill.execute_command = MagicMock()
-        mill.current_status = MagicMock(
-            side_effect=[
-                StatusReturnError("Failed to get status from the mill"),
-                "<Idle|WPos:0,0,0|FS:0,0>",
-            ]
-        )
+        failure = StatusReturnError("Failed to get status from the mill")
+        mill.current_status = MagicMock(side_effect=failure)
 
-        mill.home(timeout=1)
+        with self.assertRaises(StatusReturnError) as caught:
+            mill.home(timeout=90)
 
-        self.assertTrue(mill.homed)
-        self.assertEqual(mill.current_status.call_count, 2)
+        self.assertIs(caught.exception, failure)
+        self.assertFalse(mill.homed)
+        mill.current_status.assert_called_once()
+        mill.execute_command.assert_called_once_with("$H")
 
     @patch('cubos.gantry.gantry_driver.driver.time.sleep')
-    @patch('cubos.gantry.gantry_driver.driver.time.time', side_effect=[0.0, 0.2, 0.4])
+    @patch('cubos.gantry.gantry_driver.driver.time.time', return_value=0.0)
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
     @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')
     @patch('cubos.gantry.gantry_driver.driver.set_up_command_logger')
-    def test_home_alarm_retry_drains_before_retrying(
+    def test_home_alarm_stops_without_clearing_buffers_or_retrying(
         self, mock_cmd_logger, mock_mill_logger, mock_serial, mock_time, mock_sleep,
     ):
         mill = Mill()
-        mill.ser_mill = ScriptedSerial()
+        mill.homed = True
         mill.execute_command = MagicMock()
-        mill.current_status = MagicMock(
-            side_effect=[
-                "<Alarm|WPos:0,0,0|FS:0,0>",
-                "<Idle|WPos:0,0,0|FS:0,0>",
-            ]
-        )
+        mill.current_status = MagicMock(return_value="<Alarm|WPos:0,0,0|FS:0,0>")
         mill.clear_buffers = MagicMock()
 
-        mill.home(timeout=1)
+        with self.assertRaisesRegex(StatusReturnError, "Homing failed"):
+            mill.home(timeout=90)
 
-        self.assertEqual(mill.execute_command.call_args_list, [
-            call("$H"),
-            call("$H"),
-        ])
-        mill.clear_buffers.assert_called_once()
+        self.assertFalse(mill.homed)
+        mill.current_status.assert_called_once()
+        mill.execute_command.assert_called_once_with("$H")
+        mill.clear_buffers.assert_not_called()
 
     @patch('cubos.gantry.gantry_driver.driver.serial.Serial')
     @patch('cubos.gantry.gantry_driver.driver.set_up_mill_logger')

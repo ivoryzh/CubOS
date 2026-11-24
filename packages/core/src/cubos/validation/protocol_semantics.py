@@ -19,7 +19,10 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from cubos.gantry.instrument_mount import InstrumentedGantry
+from cubos.gantry.instrument_mount import (
+    InstrumentedGantry, resolve_multi_tool_safe_travel_z,
+)
+from cubos.data.cap_state import CapStateError, resolve_cap_target
 from cubos.deck.deck import Deck
 from cubos.deck.labware.container_role import STOCK, WASTE
 from cubos.deck.labware.tip_rack import (
@@ -32,12 +35,19 @@ from cubos.deck.labware.well_plate import WellPlate
 from cubos.gantry.gantry_config import GantryConfig
 from cubos.gantry.machine_geometry import FixedStructureBox, fixed_structures_for_gantry
 from cubos.protocol_engine.protocol import Protocol
+from cubos.protocol_engine.camera_motion import plan_image_well
 from cubos.protocol_engine.registry import CommandRegistry
+from cubos.protocol_engine.commands._liquid_transfer import (
+    LiquidTransferPreflightError,
+    pipette_capacity,
+    plan_multi_dispense,
+)
 from cubos.protocol_engine.scan_args import (
     NormalizedScanArguments,
     normalize_scan_arguments,
     surface_detection_enabled,
 )
+from cubos.instruments.potentiostat.interface import PotentiostatInstrument
 
 from .errors import ProtocolSemanticViolation
 
@@ -408,6 +418,8 @@ def _validate_pipette_engage(
     deck: Deck,
     gantry: GantryConfig,
     current_poses: dict[str, Point3D],
+    x_offset_mm: Any = 0.0,
+    y_offset_mm: Any = 0.0,
 ) -> tuple[list[ProtocolSemanticViolation], Point3D | None]:
     violations: list[ProtocolSemanticViolation] = []
     finite_violation = _finite_field_violation(
@@ -415,6 +427,15 @@ def _validate_pipette_engage(
     )
     if finite_violation is not None:
         return [finite_violation], None
+    for field_name, value in (
+        ("x_offset_mm", x_offset_mm),
+        ("y_offset_mm", y_offset_mm),
+    ):
+        finite_violation = _finite_field_violation(
+            step_index, command_name, field_name, value,
+        )
+        if finite_violation is not None:
+            return [finite_violation], None
 
     try:
         coord = deck.resolve_coordinate(position)
@@ -427,11 +448,13 @@ def _validate_pipette_engage(
             )
         ], None
 
+    target_x = coord.x + float(x_offset_mm)
+    target_y = coord.y + float(y_offset_mm)
     action_abs = coord.z + float(height)
-    action = (coord.x, coord.y, action_abs)
+    action = (target_x, target_y, action_abs)
     safe_z = _resolved_safe_z(gantry)
     if safe_z is not None:
-        safe_pose = (coord.x, coord.y, safe_z)
+        safe_pose = (target_x, target_y, safe_z)
         violations.extend(_validate_gantry_waypoint(
             step_index=step_index,
             command_name=command_name,
@@ -471,8 +494,8 @@ def _validate_pipette_engage(
         label=f"{label} action_z",
         instrument="pipette",
         instrumented_gantry=instrumented_gantry,
-        x=coord.x,
-        y=coord.y,
+        x=target_x,
+        y=target_y,
         z=action_abs,
         tip_extension=tip_extension,
     ))
@@ -499,6 +522,8 @@ def _validate_scan_points(
     approach_abs: float,
     safe_z: float | None,
     tip_extension: float = 0.0,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> list[ProtocolSemanticViolation]:
     violations: list[ProtocolSemanticViolation] = []
     for well_index, (well_id, well) in enumerate(wells):
@@ -510,8 +535,8 @@ def _validate_scan_points(
                 label=f"{plate}.{well_id} safe_z",
                 instrument=instrument,
                 instrumented_gantry=instrumented_gantry,
-                x=well.x,
-                y=well.y,
+                x=well.x + x_offset_mm,
+                y=well.y + y_offset_mm,
                 z=safe_z,
                 tip_extension=tip_extension,
             ))
@@ -522,8 +547,8 @@ def _validate_scan_points(
             label=f"{plate}.{well_id} action_z",
             instrument=instrument,
             instrumented_gantry=instrumented_gantry,
-            x=well.x,
-            y=well.y,
+            x=well.x + x_offset_mm,
+            y=well.y + y_offset_mm,
             z=action_abs,
             tip_extension=tip_extension,
         ))
@@ -534,8 +559,8 @@ def _validate_scan_points(
             label=f"{plate}.{well_id} approach_z",
             instrument=instrument,
             instrumented_gantry=instrumented_gantry,
-            x=well.x,
-            y=well.y,
+            x=well.x + x_offset_mm,
+            y=well.y + y_offset_mm,
             z=approach_abs,
             tip_extension=tip_extension,
         ))
@@ -553,16 +578,20 @@ def _validate_scan_segments(
     action_abs: float,
     approach_abs: float,
     safe_z: float | None,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> tuple[list[ProtocolSemanticViolation], Point3D | None]:
     violations: list[ProtocolSemanticViolation] = []
     pose = current
 
     for well_index, (well_id, well) in enumerate(wells):
-        approach = (well.x, well.y, approach_abs)
-        action = (well.x, well.y, action_abs)
+        x = well.x + x_offset_mm
+        y = well.y + y_offset_mm
+        approach = (x, y, approach_abs)
+        action = (x, y, action_abs)
 
         if well_index == 0 and safe_z is not None:
-            entry = (well.x, well.y, safe_z)
+            entry = (x, y, safe_z)
             violations.extend(_validate_known_transit(
                 step_index=step_index,
                 command_name="scan",
@@ -607,7 +636,11 @@ def _validate_scan_segments(
 
     if wells and pose is not None:
         last_well_id, last_well = wells[-1]
-        final_approach = (last_well.x, last_well.y, approach_abs)
+        final_approach = (
+            last_well.x + x_offset_mm,
+            last_well.y + y_offset_mm,
+            approach_abs,
+        )
         violations.extend(_validate_machine_structure_segment(
             step_index=step_index,
             command_name="scan",
@@ -709,6 +742,12 @@ def _validate_scan_command(
             _finite_field_violation(
                 step_index, "scan", "interwell_scan_height", relative_approach,
             ),
+            _finite_field_violation(
+                step_index, "scan", "x_offset_mm", args.get("x_offset_mm", 0.0),
+            ),
+            _finite_field_violation(
+                step_index, "scan", "y_offset_mm", args.get("y_offset_mm", 0.0),
+            ),
         ) if v is not None
     ]
     if finite_violations:
@@ -726,6 +765,8 @@ def _validate_scan_command(
 
     action_abs = ref_z + relative_action
     approach_abs = ref_z + relative_approach
+    x_offset = float(args.get("x_offset_mm", 0.0))
+    y_offset = float(args.get("y_offset_mm", 0.0))
 
     safe_z = _resolved_safe_z(gantry)
     if safe_z is not None and approach_abs > safe_z:
@@ -752,6 +793,8 @@ def _validate_scan_command(
         approach_abs=approach_abs,
         safe_z=safe_z,
         tip_extension=tip_ext,
+        x_offset_mm=x_offset,
+        y_offset_mm=y_offset,
     ))
 
     segment_violations, final_pose = _validate_scan_segments(
@@ -764,6 +807,8 @@ def _validate_scan_command(
         action_abs=action_abs,
         approach_abs=approach_abs,
         safe_z=safe_z,
+        x_offset_mm=x_offset,
+        y_offset_mm=y_offset,
     )
     violations.extend(segment_violations)
     if final_pose is not None:
@@ -865,11 +910,23 @@ def _validate_measure_command(
         ))
         return violations
 
-    finite_violation = _finite_field_violation(
-        step_index, "measure", "measurement_height", relative_action,
-    )
-    if finite_violation is not None:
-        violations.append(finite_violation)
+    finite_violations = [
+        violation for violation in (
+            _finite_field_violation(
+                step_index, "measure", "measurement_height", relative_action,
+            ),
+            _finite_field_violation(
+                step_index, "measure", "x_offset_mm",
+                args.get("x_offset_mm", 0.0),
+            ),
+            _finite_field_violation(
+                step_index, "measure", "y_offset_mm",
+                args.get("y_offset_mm", 0.0),
+            ),
+        ) if violation is not None
+    ]
+    if finite_violations:
+        violations.extend(finite_violations)
         return violations
 
     try:
@@ -882,11 +939,13 @@ def _validate_measure_command(
         ))
         return violations
 
+    target_x = coord.x + float(args.get("x_offset_mm", 0.0))
+    target_y = coord.y + float(args.get("y_offset_mm", 0.0))
     action_abs = coord.z + relative_action
-    action = (coord.x, coord.y, action_abs)
+    action = (target_x, target_y, action_abs)
     safe_z = _resolved_safe_z(gantry)
     if safe_z is not None:
-        safe_pose = (coord.x, coord.y, safe_z)
+        safe_pose = (target_x, target_y, safe_z)
         violations.extend(_validate_gantry_waypoint(
             step_index=step_index,
             command_name="measure",
@@ -926,8 +985,8 @@ def _validate_measure_command(
         label=f"measure {position!r} action_z",
         instrument=instrument,
         instrumented_gantry=instrumented_gantry,
-        x=coord.x,
-        y=coord.y,
+        x=target_x,
+        y=target_y,
         z=action_abs,
         tip_extension=tip_ext,
     ))
@@ -967,6 +1026,92 @@ def _validate_measure_command(
     return violations
 
 
+def _validate_rinse_command(
+    *,
+    step_index: int,
+    args: dict[str, Any],
+    instrumented_gantry: InstrumentedGantry,
+    deck: Deck,
+    gantry: GantryConfig,
+    current_poses: dict[str, Point3D],
+) -> list[ProtocolSemanticViolation]:
+    violations: list[ProtocolSemanticViolation] = []
+    command = "rinse"
+    instrument = args.get("instrument")
+    vial = args.get("vial")
+    height = args.get("measurement_height")
+    instr = instrumented_gantry.instruments.get(instrument)
+    if instr is None:
+        return [_violation(step_index, command, f"unknown instrument {instrument!r}.")]
+    if not isinstance(instr, PotentiostatInstrument):
+        violations.append(_violation(
+            step_index, command,
+            f"instrument {instrument!r} must be a PotentiostatInstrument.",
+        ))
+    finite = _finite_field_violation(step_index, command, "measurement_height", height)
+    if finite is not None:
+        return violations + [finite]
+    if height >= 0:
+        violations.append(_violation(
+            step_index, command,
+            f"measurement_height ({height}) must be negative (below the vial rim).",
+        ))
+    try:
+        target = deck.resolve_labware(vial)
+        coord = deck.resolve_coordinate(vial)
+    except (KeyError, AttributeError, ValueError) as exc:
+        return violations + [_violation(
+            step_index, command, f"vial {vial!r} cannot be resolved on the deck: {exc}",
+        )]
+    if not isinstance(target, Vial):
+        violations.append(_violation(
+            step_index, command,
+            f"target {vial!r} must resolve to a single Vial.",
+        ))
+        return violations
+    safe_z = _resolved_safe_z(gantry)
+    action_z = coord.z + float(height)
+    if safe_z <= coord.z:
+        violations.append(_violation(
+            step_index, command,
+            f"safe_z ({safe_z}) must be above vial rim Z ({coord.z}) for retraction.",
+        ))
+    if action_z > safe_z:
+        violations.append(_violation(
+            step_index, command,
+            f"resolved rinse action Z ({action_z:.3f}) is above safe_z ({safe_z}).",
+        ))
+    safe_pose = (coord.x, coord.y, safe_z)
+    action_pose = (coord.x, coord.y, action_z)
+    violations.extend(_validate_gantry_waypoint(
+        step_index=step_index, command_name=command, gantry=gantry,
+        label=f"rinse {vial!r} safe_z", instrument=instrument,
+        instrumented_gantry=instrumented_gantry, x=coord.x, y=coord.y, z=safe_z,
+    ))
+    violations.extend(_validate_gantry_waypoint(
+        step_index=step_index, command_name=command, gantry=gantry,
+        label=f"rinse {vial!r} action_z", instrument=instrument,
+        instrumented_gantry=instrumented_gantry, x=coord.x, y=coord.y, z=action_z,
+    ))
+    violations.extend(_validate_machine_structure_segment(
+        step_index=step_index, command_name=command, gantry=gantry,
+        label=f"rinse {vial!r} immersion", instrument=instrument,
+        start=safe_pose, end=action_pose,
+    ))
+    violations.extend(_validate_known_transit(
+        step_index=step_index,
+        command_name=command,
+        gantry=gantry,
+        label=f"rinse {vial!r} transit",
+        instrument=instrument,
+        current=current_poses.get(instrument),
+        target=safe_pose,
+        travel_z=safe_z,
+    ))
+    current_poses[instrument] = safe_pose
+    return violations
+
+
 def _validate_move_waypoints(
     *,
     step_index: int,
@@ -985,6 +1130,20 @@ def _validate_move_waypoints(
     if instrument not in instrumented_gantry.instruments:
         return violations
     tip_ext = pipette_tip_extension if instrument == "pipette" else 0.0
+    offset_violations = [
+        violation for violation in (
+            _finite_field_violation(
+                step_index, "move", "x_offset_mm", args.get("x_offset_mm", 0.0),
+            ),
+            _finite_field_violation(
+                step_index, "move", "y_offset_mm", args.get("y_offset_mm", 0.0),
+            ),
+        ) if violation is not None
+    ]
+    if offset_violations:
+        return offset_violations
+    x_offset = float(args.get("x_offset_mm", 0.0))
+    y_offset = float(args.get("y_offset_mm", 0.0))
 
     target: Point3D | None = None
     target_label = f"move target {position!r}"
@@ -1040,23 +1199,34 @@ def _validate_move_waypoints(
                 f"not deck target {position!r}.",
             ))
             return violations
-        safe_z = _resolved_safe_z(gantry)
-        if safe_z is None:
-            violations.append(_violation(
-                step_index,
-                "move",
-                f"deck-target move to {position!r} requires gantry `safe_z` "
-                "to be configured.",
-            ))
-            return violations
-        target = (coord.x, coord.y, safe_z)
-        target_label = f"move safe_z for {position!r}"
-        transit_z = safe_z
+        if deck.planning_enabled:
+            carriage_ceiling = gantry.working_volume.z_max
+            instrument_config = instrumented_gantry.instruments[instrument]
+            target_z = carriage_ceiling - instrument_config.depth - tip_ext
+            target = (coord.x, coord.y, target_z)
+            target_label = f"move carriage ceiling for {position!r}"
+            transit_z = target_z
+        else:
+            safe_z = _resolved_safe_z(gantry)
+            if safe_z is None:
+                violations.append(_violation(
+                    step_index,
+                    "move",
+                    f"deck-target move to {position!r} requires gantry `safe_z` "
+                    "to be configured.",
+                ))
+                return violations
+            target = (coord.x, coord.y, safe_z)
+            target_label = f"move safe_z for {position!r}"
+            transit_z = safe_z
 
     if target is None:
         return violations
 
     x, y, z = target
+    x += x_offset
+    y += y_offset
+    target = (x, y, z)
     violations.extend(_validate_gantry_waypoint(
         step_index=step_index,
         command_name="move",
@@ -1179,11 +1349,13 @@ def _require_attached_tip(
 
 _PIPETTE_COMMANDS = frozenset({
     "aspirate",
+    "dispense",
     "blowout",
     "clear_well",
     "drop_tip",
     "flush_pipette",
     "mix",
+    "multi_dispense",
     "pick_up_tip",
     "purge_pipette",
     "rinse_well",
@@ -1379,6 +1551,8 @@ def _validate_pipette_command(
             deck=deck,
             gantry=gantry,
             current_poses=current_poses,
+            x_offset_mm=args.get("x_offset_mm", 0.0),
+            y_offset_mm=args.get("y_offset_mm", 0.0),
         )
         violations.extend(engage_violations)
         metadata_violations, tip_extension = _validate_tip_pickup_metadata(
@@ -1420,6 +1594,8 @@ def _validate_pipette_command(
             deck=deck,
             gantry=gantry,
             current_poses=current_poses,
+            x_offset_mm=args.get("x_offset_mm", 0.0),
+            y_offset_mm=args.get("y_offset_mm", 0.0),
         )
         violations.extend(engage_violations)
         # Like pick_up_tip above, advance state independently of engage
@@ -1434,7 +1610,7 @@ def _validate_pipette_command(
             )
         return violations, tip_state
 
-    if command_name in {"aspirate", "blowout", "mix"}:
+    if command_name in {"aspirate", "dispense", "blowout", "mix"}:
         violations.extend(_require_attached_tip(
             step_index=step_index,
             command_name=command_name,
@@ -1452,8 +1628,27 @@ def _validate_pipette_command(
             deck=deck,
             gantry=gantry,
             current_poses=current_poses,
+            x_offset_mm=args.get("x_offset_mm", 0.0),
+            y_offset_mm=args.get("y_offset_mm", 0.0),
         )
         violations.extend(engage_violations)
+        if command_name == "mix":
+            finish_violations, _ = _validate_pipette_engage(
+                step_index=step_index,
+                command_name=command_name,
+                label=f"mix blowout {args.get('position')!r}",
+                position=args.get("position"),
+                height=_height_value(args, "blowout_height"),
+                height_field_name="blowout_height",
+                tip_extension=tip_state.tip_extension,
+                instrumented_gantry=instrumented_gantry,
+                deck=deck,
+                gantry=gantry,
+                current_poses=current_poses,
+                x_offset_mm=args.get("x_offset_mm", 0.0),
+                y_offset_mm=args.get("y_offset_mm", 0.0),
+            )
+            violations.extend(finish_violations)
         return violations, tip_state
 
     if command_name == "transfer":
@@ -1462,9 +1657,12 @@ def _validate_pipette_command(
             command_name=command_name,
             tip_state=tip_state,
         ))
-        for label, position_key, height_key in (
-            ("transfer.aspirate", "source", "source_height"),
-            ("transfer.dispense", "destination", "destination_height"),
+        for label, position_key, height_key, offset_prefix in (
+            ("transfer.aspirate", "source", "source_height", "source"),
+            (
+                "transfer.dispense", "destination", "destination_height",
+                "destination",
+            ),
         ):
             engage_violations, _ = _validate_pipette_engage(
                 step_index=step_index,
@@ -1477,6 +1675,34 @@ def _validate_pipette_command(
                 instrumented_gantry=instrumented_gantry,
                 deck=deck,
                 gantry=gantry,
+                current_poses=current_poses,
+                x_offset_mm=args.get(f"{offset_prefix}_x_offset_mm", 0.0),
+                y_offset_mm=args.get(f"{offset_prefix}_y_offset_mm", 0.0),
+            )
+            violations.extend(engage_violations)
+        return violations, tip_state
+
+    if command_name == "multi_dispense":
+        violations.extend(_require_attached_tip(
+            step_index=step_index, command_name=command_name, tip_state=tip_state,
+        ))
+        try:
+            plan_multi_dispense(
+                args.get("destinations", []), args.get("volumes", []),
+                pipette_capacity(instrumented_gantry.instruments["pipette"]),
+            )
+        except LiquidTransferPreflightError as exc:
+            violations.append(_violation(step_index, command_name, str(exc)))
+        for position, height_key in [
+            (args.get("source"), "source_height"),
+            *((target, "destination_height") for target in args.get("destinations", [])),
+        ]:
+            engage_violations, _ = _validate_pipette_engage(
+                step_index=step_index, command_name=command_name,
+                label=f"multi_dispense {position!r}", position=position,
+                height=_height_value(args, height_key), height_field_name=height_key,
+                tip_extension=tip_state.tip_extension,
+                instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
                 current_poses=current_poses,
             )
             violations.extend(engage_violations)
@@ -1500,6 +1726,8 @@ def _validate_pipette_command(
             deck=deck,
             gantry=gantry,
             current_poses=current_poses,
+            x_offset_mm=args.get("source_x_offset_mm", 0.0),
+            y_offset_mm=args.get("source_y_offset_mm", 0.0),
         )
         violations.extend(engage_violations)
 
@@ -1523,6 +1751,8 @@ def _validate_pipette_command(
                 deck=deck,
                 gantry=gantry,
                 current_poses=current_poses,
+                x_offset_mm=args.get("destination_x_offset_mm", 0.0),
+                y_offset_mm=args.get("destination_y_offset_mm", 0.0),
             )
             violations.extend(engage_violations)
         return violations, tip_state
@@ -1540,6 +1770,17 @@ def _validate_pipette_command(
             instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
             current_poses=current_poses,
         ))
+        repetitions = args.get("mix_repetitions", 0)
+        if isinstance(repetitions, int) and repetitions > 0:
+            finish_violations, _ = _validate_pipette_engage(
+                step_index=step_index, command_name=command_name,
+                label=f"rinse_well mix blowout {well!r}", position=well,
+                height=0.0, height_field_name="blowout_height",
+                tip_extension=tip_state.tip_extension,
+                instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+                current_poses=current_poses,
+            )
+            violations.extend(finish_violations)
         source = args.get("source")
         solution = args.get("solution")
         violations.extend(_validate_stock_or_solution(
@@ -1669,6 +1910,80 @@ def _validate_pipette_command(
     return violations, tip_state
 
 
+def _validate_pipette_blowout_retracts(
+    *, step_index: int, command_name: str, args: dict[str, Any],
+    instrumented_gantry: InstrumentedGantry, deck: Deck, gantry: GantryConfig,
+    current_poses: dict[str, Point3D], tip_extension: float,
+) -> list[ProtocolSemanticViolation]:
+    pipette = instrumented_gantry.instruments.get("pipette")
+    if getattr(pipette, "requires_home_after_blowout", False) is not True:
+        return []
+    destinations = []
+    if command_name == "blowout":
+        destinations.append((args.get("position"), args.get("height", 0.0),
+                             args.get("x_offset_mm", 0.0), args.get("y_offset_mm", 0.0)))
+    elif command_name == "mix":
+        destinations.append((args.get("position"), args.get("blowout_height", 0.0),
+                             args.get("x_offset_mm", 0.0), args.get("y_offset_mm", 0.0)))
+    elif command_name == "transfer":
+        destinations.append((args.get("destination"), args.get("destination_height", 0.0),
+                             args.get("destination_x_offset_mm", 0.0), args.get("destination_y_offset_mm", 0.0)))
+    elif command_name == "multi_dispense":
+        targets = args.get("destinations", [])
+        if isinstance(targets, list) and targets:
+            destinations.append((targets[-1], args.get("destination_height", 0.0), 0.0, 0.0))
+    elif command_name == "serial_transfer":
+        plate_name = args.get("plate")
+        try:
+            plate = deck.resolve_labware(plate_name)
+        except (KeyError, TypeError, AttributeError):
+            return []
+        if isinstance(plate, WellPlate):
+            destinations.extend((f"{plate_name}.{well}", args.get("destination_height", 0.0),
+                                 args.get("destination_x_offset_mm", 0.0), args.get("destination_y_offset_mm", 0.0))
+                                for well in _wells_for_axis(plate, args.get("axis")))
+    elif command_name in {"rinse_well", "flush_pipette", "purge_pipette", "clear_well"}:
+        if command_name == "rinse_well":
+            destinations.append((args.get("well"), args.get("well_height", 0.0), 0.0, 0.0))
+        destinations.append((args.get("waste"), args.get("waste_height", 0.0), 0.0, 0.0))
+    violations = []
+    for position, height, dx, dy in destinations:
+        if height is None and command_name != "blowout":
+            height = 0.0
+        if not isinstance(position, str):
+            current_poses.pop("pipette", None)
+            continue
+        try:
+            coord = deck.resolve_coordinate(position)
+        except (KeyError, ValueError):
+            continue
+        if any(_finite_field_violation(step_index, command_name, name, value) is not None
+               for name, value in (("height", height), ("x_offset_mm", dx), ("y_offset_mm", dy))):
+            continue
+        safe_z = gantry.resolved_safe_z
+        action = (coord.x + dx, coord.y + dy, coord.z + height)
+        retract = (action[0], action[1], safe_z)
+        if safe_z <= max(coord.z, action[2]):
+            violations.append(_violation(
+                step_index, command_name,
+                f"blowout at {position!r} requires safe_z above both the labware "
+                "surface and action height before returning the piston home.",
+            ))
+        violations.extend(_validate_gantry_waypoint(
+            step_index=step_index, command_name=command_name, gantry=gantry,
+            label=f"blowout retract at {position!r}", instrument="pipette",
+            instrumented_gantry=instrumented_gantry, x=retract[0], y=retract[1], z=retract[2],
+            tip_extension=tip_extension,
+        ))
+        violations.extend(_validate_machine_structure_segment(
+            step_index=step_index, command_name=command_name, gantry=gantry,
+            label=f"blowout retract at {position!r}", instrument="pipette",
+            start=action, end=retract,
+        ))
+        current_poses["pipette"] = retract
+    return violations
+
+
 def _validate_asmi_indentation(
     *,
     step_index: int,
@@ -1783,6 +2098,153 @@ def _validate_asmi_indentation(
     return violations
 
 
+def _validate_instrument_reference(
+    *,
+    step_index: int,
+    command_name: str,
+    instrument: Any,
+    field_name: str,
+    instrumented_gantry: InstrumentedGantry,
+) -> list[ProtocolSemanticViolation]:
+    """Check that an instrument-name argument names a mounted instrument."""
+    if instrument not in instrumented_gantry.instruments:
+        return [_violation(
+            step_index,
+            command_name,
+            f"unknown {field_name} {instrument!r}. Available: "
+            f"{', '.join(sorted(instrumented_gantry.instruments.keys()))}.",
+        )]
+    return []
+
+
+def _validate_cure_command(
+    *,
+    step_index: int,
+    args: dict[str, Any],
+    instrumented_gantry: InstrumentedGantry,
+    deck: Deck,
+) -> list[ProtocolSemanticViolation]:
+    """Check ``cure``'s ``instrument``/``position`` resolve.
+
+    ``cure`` is a thin wrapper over ``measure``'s travel machinery but is
+    dispatched separately here (rather than through ``_validate_measure_command``)
+    because its instrument is a UV-curing device, not a sensor -- the ASMI
+    indentation/bounds machinery ``_validate_measure_command`` also runs
+    does not apply and would mislabel violations under a ``measure`` command
+    name.
+    """
+    instrument_violations = _validate_instrument_reference(
+        step_index=step_index,
+        command_name="cure",
+        instrument=args.get("instrument"),
+        field_name="instrument",
+        instrumented_gantry=instrumented_gantry,
+    )
+    if instrument_violations:
+        return instrument_violations
+    position = args.get("position")
+    try:
+        deck.resolve_coordinate(position)
+    except (KeyError, AttributeError, ValueError) as exc:
+        return [_violation(
+            step_index,
+            "cure",
+            f"position {position!r} cannot be resolved on the deck: {exc}",
+        )]
+    return []
+
+
+def _validate_cap_decap_command(
+    *,
+    step_index: int,
+    command_name: str,
+    args: dict[str, Any],
+    instrumented_gantry: InstrumentedGantry,
+    deck: Deck,
+) -> list[ProtocolSemanticViolation]:
+    """Check ``cap``/``decap``'s ``instrument``/``vial`` resolve."""
+    instrument_violations = _validate_instrument_reference(
+        step_index=step_index,
+        command_name=command_name,
+        instrument=args.get("instrument"),
+        field_name="instrument",
+        instrumented_gantry=instrumented_gantry,
+    )
+    if instrument_violations:
+        return instrument_violations
+    vial = args.get("vial")
+    try:
+        resolve_cap_target(deck, vial)
+    except CapStateError as exc:
+        return [_violation(
+            step_index,
+            command_name,
+            f"vial {vial!r} cannot be resolved on the deck: {exc}",
+        )]
+    return []
+
+
+def _validate_image_well_command(
+    *,
+    step_index: int,
+    args: dict[str, Any],
+    instrumented_gantry: InstrumentedGantry,
+    deck: Deck,
+    gantry: GantryConfig,
+    current_poses: dict[str, Point3D],
+) -> list[ProtocolSemanticViolation]:
+    """Validate the camera's clearance, captures, and connecting segments."""
+    camera = args.get("camera")
+    violations = _validate_instrument_reference(
+        step_index=step_index, command_name="image_well", instrument=camera,
+        field_name="camera", instrumented_gantry=instrumented_gantry,
+    )
+    lights = args.get("lights")
+    if lights is not None:
+        violations.extend(_validate_instrument_reference(
+            step_index=step_index, command_name="image_well", instrument=lights,
+            field_name="lights instrument", instrumented_gantry=instrumented_gantry,
+        ))
+    if violations:
+        return violations
+    well = args.get("well")
+    try:
+        coord = deck.resolve_coordinate(well)
+    except (KeyError, AttributeError, ValueError) as exc:
+        return [_violation(step_index, "image_well", f"well {well!r} cannot be resolved on the deck: {exc}")]
+    try:
+        motion = plan_image_well(coord, args)
+    except ValueError as exc:
+        return [_violation(step_index, "image_well", str(exc))]
+    clearance = resolve_multi_tool_safe_travel_z(
+        safe_z=gantry.resolved_safe_z,
+        carriage_ceiling=gantry.working_volume.z_max,
+        effective_depth=instrumented_gantry.instruments[camera].effective_depth,
+    )
+    approach = (*motion.positions[0][:2], clearance)
+    retract = (*motion.positions[-1][:2], clearance)
+    points = [approach, *motion.positions, retract]
+    for index, point in enumerate(points):
+        violations.extend(_validate_gantry_waypoint(
+            step_index=step_index, command_name="image_well", gantry=gantry,
+            label=f"image_well {well!r} waypoint {index}", instrument=camera,
+            instrumented_gantry=instrumented_gantry,
+            x=point[0], y=point[1], z=point[2],
+        ))
+    violations.extend(_validate_known_transit(
+        step_index=step_index, command_name="image_well", gantry=gantry,
+        label=f"image_well {well!r} approach", instrument=camera,
+        current=current_poses.get(camera), target=approach, travel_z=clearance,
+    ))
+    for start, end in zip(points, points[1:]):
+        violations.extend(_validate_machine_structure_segment(
+            step_index=step_index, command_name="image_well", gantry=gantry,
+            label=f"image_well {well!r}", instrument=camera, start=start, end=end,
+        ))
+    current_poses[camera] = retract
+    return violations
+
+
 def validate_protocol_semantics(
     protocol: Protocol,
     instrumented_gantry: InstrumentedGantry,
@@ -1825,6 +2287,15 @@ def validate_protocol_semantics(
                 current_poses=current_poses,
                 pipette_tip_extension=pipette_tip_state.tip_extension,
             ))
+        elif step.command_name == "rinse":
+            violations.extend(_validate_rinse_command(
+                step_index=step.index,
+                args=step.args,
+                instrumented_gantry=instrumented_gantry,
+                deck=deck,
+                gantry=gantry,
+                current_poses=current_poses,
+            ))
         elif step.command_name == "scan":
             violations.extend(_validate_scan_command(
                 step_index=step.index,
@@ -1834,6 +2305,30 @@ def validate_protocol_semantics(
                 gantry=gantry,
                 current_poses=current_poses,
                 pipette_tip_extension=pipette_tip_state.tip_extension,
+            ))
+        elif step.command_name == "cure":
+            violations.extend(_validate_cure_command(
+                step_index=step.index,
+                args=step.args,
+                instrumented_gantry=instrumented_gantry,
+                deck=deck,
+            ))
+        elif step.command_name in ("cap", "decap"):
+            violations.extend(_validate_cap_decap_command(
+                step_index=step.index,
+                command_name=step.command_name,
+                args=step.args,
+                instrumented_gantry=instrumented_gantry,
+                deck=deck,
+            ))
+        elif step.command_name == "image_well":
+            violations.extend(_validate_image_well_command(
+                step_index=step.index,
+                args=step.args,
+                instrumented_gantry=instrumented_gantry,
+                deck=deck,
+                gantry=gantry,
+                current_poses=current_poses,
             ))
         else:
             pipette_violations, pipette_tip_state = _validate_pipette_command(
@@ -1847,4 +2342,9 @@ def validate_protocol_semantics(
                 tip_state=pipette_tip_state,
             )
             violations.extend(pipette_violations)
+            violations.extend(_validate_pipette_blowout_retracts(
+                step_index=step.index, command_name=step.command_name, args=step.args,
+                instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+                current_poses=current_poses, tip_extension=pipette_tip_state.tip_extension,
+            ))
     return violations

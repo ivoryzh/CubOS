@@ -44,6 +44,7 @@ class CncYaml(BaseModel):
     calibration_block_height_mm: Optional[float] = None
     y_axis_motion: Literal["head", "bed"] = "head"
     safe_z: Optional[float] = None
+    default_feed_rate_mm_min: Optional[float] = None
 
     @model_validator(mode="after")
     def _validate_cnc_z_values(self) -> "CncYaml":
@@ -67,7 +68,7 @@ class GantryYamlSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     serial_port: str
-    gantry_type: Literal["cub", "cub_xl"]
+    gantry_type: Literal["cub", "cub_xl", "genmitsu_4040_pro_max"]
     cnc: CncYaml
     working_volume: WorkingVolumeYaml
     origin_policy: Literal["deck_origin", "home_origin"] = "deck_origin"

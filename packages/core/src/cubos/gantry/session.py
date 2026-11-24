@@ -16,6 +16,9 @@ import yaml
 
 from cubos.data import DataStore, create_campaign_for_protocol_run
 from cubos.gantry.gantry import Gantry
+from cubos.gantry.errors import CommandExecutionError, JogAcceptanceUnknownError, MillConnectionError
+from cubos.gantry.gantry_config import OriginPolicy
+from cubos.gantry.origin import translate_calibrated_safe_z
 from cubos.gantry.grbl_settings import normalize_expected_grbl_settings
 from cubos.gantry.limit_recovery import (
     LimitRecoveryResult,
@@ -41,6 +44,18 @@ class GantryPositionSnapshot:
 
 
 @dataclass(frozen=True)
+class LimitRecoveryContext:
+    raw_status: str
+    active_limit_axes: list[str]
+    failed_jog_delta: dict[str, float] | None
+    eligible: bool
+    blocked_reason: str | None
+    pull_off_delta: dict[str, float] | None
+    manual_available: bool
+    failed_jog_id: str | None = None
+
+
+@dataclass(frozen=True)
 class CalibrationCenterResult:
     xy_bounds: dict[str, float]
     position: dict[str, float]
@@ -53,6 +68,9 @@ class FinalizeOriginResult:
     max_travel: dict[str, float]
     position: dict[str, float]
     homing_pull_off_mm: Optional[float] = None
+    origin_policy: str = "deck_origin"
+    working_volume: dict[str, float] | None = None
+    safe_z: float | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +83,10 @@ class ProtocolRunResult:
 
 class GantrySessionError(Exception):
     """Base class for persistent gantry-session failures."""
+
+
+class GantryJogCancelledError(GantrySessionError):
+    """A jog was cancelled without completing its requested displacement."""
 
 
 class GantryNotConnectedError(GantrySessionError):
@@ -108,14 +130,27 @@ class GantrySession:
         self._gantry_factory = gantry_factory
         self._sleep = sleep
         self._lock = threading.Lock()
+        self._jog_history_lock = threading.Lock()
         self._gantry: Gantry | None = None
         self._last_position: GantryPositionSnapshot | None = None
         self._calibration_warning: str | None = None
         self._connected_gantry_config: dict[str, Any] | None = None
         self._connected_gantry_filename: str | None = None
         self._calibration_restore_soft_limits = False
+        self._calibration_restore_hard_limits = False
         self._calibration_jog_bypass_working_volume = False
+        self._calibration_frame_unverified = False
+        self._calibration_pending_config: dict[str, Any] | None = None
         self._move_error: str | None = None
+        self._alarm_status: str | None = None
+        self._position_query_failed = False
+        self._position_reference_untrusted = False
+        self._homing_active = False
+        self._last_jog_delta: dict[str, float] | None = None
+        self._failed_jog_delta: dict[str, float] | None = None
+        self._last_jog_id: str | None = None
+        self._failed_jog_id: str | None = None
+        self._jog_cancel_generation = 0
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
     @property
@@ -124,6 +159,9 @@ class GantrySession:
 
     @property
     def calibration_warning(self) -> str | None:
+        if self._position_reference_untrusted and not self._homing_active:
+            warning = "Position reference is unverified after a controller fault. Home before moving or capturing calibration."
+            return f"{self._calibration_warning} {warning}" if self._calibration_warning else warning
         return self._calibration_warning
 
     @property
@@ -136,11 +174,24 @@ class GantrySession:
         return bool(
             self._calibration_jog_bypass_working_volume
             or self._calibration_restore_soft_limits
+            or self._calibration_restore_hard_limits
+            or self._calibration_frame_unverified
+            or self._calibration_pending_config is not None
         )
 
     @property
     def connected_gantry_filename(self) -> str | None:
         return self._connected_gantry_filename
+
+    @property
+    def connected_gantry_config(self) -> dict[str, Any] | None:
+        """Deep copy of the YAML config the connected gantry was built from.
+
+        ``None`` while disconnected. Consumers (e.g. the API's manual
+        instrument endpoints) read the ``instruments:`` section from here so
+        they act on exactly the configuration the operator connected.
+        """
+        return copy.deepcopy(self._connected_gantry_config)
 
     @property
     def operation_lock(self) -> threading.Lock:
@@ -153,27 +204,61 @@ class GantrySession:
         *,
         filename: str | None = None,
     ) -> GantryPositionSnapshot:
-        """Connect a gantry and publish it only after the full handshake works."""
+        """Connect a verified gantry or publish a faulted recovery-only session."""
         with self._lock:
+            config = self._load_config_from_yaml(config_path) if config_path is not None else {}
+            if self._calibration_pending_config is not None and not self._matches_pending_calibration_locked(config):
+                raise CalibrationBlockedError("Save the finalized calibration and reconnect with that saved configuration.")
             if self._gantry is not None:
                 self._restore_calibration_soft_limits_if_needed_locked()
                 self._gantry.disconnect()
                 self._clear_connected_state_locked()
-            config = (
-                self._load_config_from_yaml(config_path)
-                if config_path is not None
-                else {}
-            )
             staged = self._gantry_factory(config=self._runtime_connect_config(config))
             port = str(config.get("serial_port") or "") or None
+            connect_fault: str | None = None
+            recovery_status: str | None = None
+            calibration_warning: str | None = None
             try:
-                staged.connect(port=port)
-                calibration_warning = self._calibration_mismatch_warning(staged, config)
-                for _ in range(10):
-                    info = staged.get_position_info()
-                    if info.get("work_pos") is not None:
-                        break
-                    self._sleep(0.1)
+                try:
+                    staged.connect(port=port)
+                    calibration_warning = self._calibration_mismatch_warning(staged, config)
+                    for _ in range(10):
+                        info = staged.get_position_info()
+                        raw_status = str(info.get("raw_status", info.get("status", "Unknown")))
+                        if looks_like_limit_alarm(raw_status):
+                            raise GantryAlarmError(raw_status)
+                        work_pos = info.get("work_pos")
+                        coords = info.get("coords")
+                        if work_pos is not None:
+                            if not all(
+                                isinstance(position, dict)
+                                and all(math.isfinite(float(position[axis])) for axis in ("x", "y", "z"))
+                                for position in (work_pos, coords)
+                            ):
+                                raise GantrySessionError("Connection did not verify finite current coordinates.")
+                            break
+                        self._sleep(0.1)
+                    else:
+                        raise GantrySessionError("Connection did not verify current work coordinates.")
+                except MillConnectionError:
+                    raise
+                except Exception as exc:
+                    if not self._looks_like_alarm_error(exc):
+                        raise
+                    connect_fault = self._alarm_status_from_error(exc)
+                    try:
+                        recovery_status = str(staged.get_recovery_status())
+                    except MillConnectionError:
+                        raise
+                    except Exception as recovery_exc:
+                        if not self._looks_like_alarm_error(recovery_exc):
+                            raise
+                        recovery_status = self._alarm_status_from_error(recovery_exc)
+                    if not (
+                        re.match(r"^<(?:idle|alarm|hold|door|check|home|run|jog|sleep)(?::\d+)?(?:\||>)", recovery_status, re.IGNORECASE)
+                        and recovery_status.endswith(">")
+                    ) and re.fullmatch(r"ALARM:\d+", recovery_status, re.IGNORECASE) is None:
+                        raise GantrySessionError("Connection fault status could not be verified from a controller report.")
             except Exception:
                 try:
                     staged.disconnect()
@@ -182,11 +267,21 @@ class GantrySession:
                 raise
 
             self._gantry = staged
-            self._calibration_warning = calibration_warning
+            self._calibration_warning = (
+                "Calibration origin did not verify. Restart full calibration before moving or running protocols."
+                if self._calibration_frame_unverified else calibration_warning
+            )
             self._calibration_restore_soft_limits = False
+            self._calibration_restore_hard_limits = False
             self._calibration_jog_bypass_working_volume = False
             self._connected_gantry_config = copy.deepcopy(config)
             self._connected_gantry_filename = filename
+            self._calibration_pending_config = None
+            if connect_fault is not None:
+                self._latch_alarm_locked(connect_fault)
+                if recovery_status and looks_like_limit_alarm(recovery_status):
+                    self._latch_alarm_locked(recovery_status)
+                return self._position_from_cache_with_status(self._alarm_status)
 
         return self.position()
 
@@ -235,6 +330,10 @@ class GantrySession:
         with self._lock:
             if self._gantry is None or self._connected_gantry_filename != filename:
                 return
+            if self._calibration_pending_config is not None:
+                if not self._matches_pending_calibration_locked(config):
+                    return
+                self._calibration_pending_config = None
             self._connected_gantry_config = copy.deepcopy(config)
             self._gantry.config = self._runtime_connect_config(config)
 
@@ -247,33 +346,42 @@ class GantrySession:
         try:
             return self._read_position_locked()
         except Exception as exc:
+            self._position_query_failed = True
             if self._looks_like_alarm_error(exc):
-                return self._position_from_cache_with_status(
-                    self._alarm_status_from_error(exc)
-                )
-            if (
-                self._last_position is not None
-                and not self._calibration_jog_bypass_working_volume
-            ):
-                return self._last_position
+                self._latch_alarm_locked(self._alarm_status_from_error(exc))
             return self._position_from_cache_with_status("Query failed")
         finally:
             self._lock.release()
 
     def home(self) -> GantryPositionSnapshot:
         with self._locked_gantry() as gantry:
-            gantry.home()
-        return self.position()
+            try:
+                return self._home_and_verify_locked(gantry)
+            except Exception as exc:
+                if self._looks_like_alarm_error(exc):
+                    self._latch_alarm_locked(self._alarm_status_from_error(exc))
+                raise
 
     def unlock(self) -> GantryPositionSnapshot:
         with self._locked_gantry() as gantry:
-            gantry.unlock()
-        return self.position()
+            try:
+                gantry.unlock()
+                return self._verify_operator_recovery_locked()
+            except Exception as exc:
+                if self._looks_like_alarm_error(exc):
+                    self._latch_alarm_locked(self._alarm_status_from_error(exc))
+                raise
 
     def reset_and_unlock(self) -> GantryPositionSnapshot:
         with self._locked_gantry() as gantry:
-            gantry.reset_and_unlock()
-        return self.position()
+            try:
+                self._clear_jog_history_locked()
+                gantry.reset_and_unlock()
+                return self._verify_operator_recovery_locked()
+            except Exception as exc:
+                if self._looks_like_alarm_error(exc):
+                    self._latch_alarm_locked(self._alarm_status_from_error(exc))
+                raise
 
     def resume(self) -> GantryPositionSnapshot:
         """Resume a feed-held controller after an explicit operator action."""
@@ -300,12 +408,19 @@ class GantrySession:
             raise
 
     def jog_cancel(self) -> GantryPositionSnapshot:
+        self._cancel_jog_ownership()
         with self._locked_gantry() as gantry:
             gantry.jog_cancel()
         return self.position()
 
     def jog_cancel_interrupt(self) -> None:
-        """Cancel an active jog without waiting for the operation lock."""
+        """Cancel an active jog without waiting for the operation lock.
+
+        Also bumps the cancel generation so jog requests already queued on
+        the operation lock are dropped instead of restarting motion after
+        the cancel (GRBL 0x85 only flushes what is already in its planner).
+        """
+        self._cancel_jog_ownership()
         self._require_connected().jog_cancel()
 
     def read_grbl_settings(self) -> dict[str, str]:
@@ -325,7 +440,7 @@ class GantrySession:
             self._validate_manual_move_target_locked(x=x, y=y, z=z)
         thread = threading.Thread(
             target=self._move_worker,
-            args=(float(x), float(y), float(z)),
+            args=(float(x), float(y), float(z), self._jog_cancel_generation),
             daemon=True,
         )
         thread.start()
@@ -333,6 +448,7 @@ class GantrySession:
     def move_to_blocking(self, *, x: float, y: float, z: float) -> GantryPositionSnapshot:
         with self._locked_gantry() as gantry:
             self._validate_manual_move_target_locked(x=x, y=y, z=z)
+            self._clear_jog_history_locked()
             gantry.move_to(x=float(x), y=float(y), z=float(z))
         return self.position()
 
@@ -343,16 +459,33 @@ class GantrySession:
         y: float = 0.0,
         z: float = 0.0,
         feed_rate: float = 2000,
+        jog_id: str | None = None,
     ) -> None:
+        self._validate_jog_id(jog_id)
         self._require_connected()
         if x == 0 and y == 0 and z == 0:
             return
+        generation = self._jog_cancel_generation
         with self._lock:
+            if generation != self._jog_cancel_generation:
+                # A jog cancel arrived while this request waited on the
+                # operation lock. Sending the jog now would restart motion
+                # the operator just stopped, so drop it.
+                return
             self._validate_jog_target_locked(x=x, y=y, z=z)
+            accepted = False
             try:
                 self._require_connected().jog(x=x, y=y, z=z, feed_rate=feed_rate)
+                self._record_accepted_jog_locked({"x": float(x), "y": float(y), "z": float(z)}, jog_id, generation)
+                accepted = True
+            except (JogAcceptanceUnknownError, MillConnectionError):
+                self._invalidate_jog_reference_locked()
+                raise
             except Exception as exc:
                 if self._looks_like_alarm_error(exc):
+                    if not accepted and any(token in str(exc).lower() for token in ("alarm", "check limits")):
+                        self._invalidate_jog_reference_locked()
+                    self._latch_alarm_locked(self._alarm_status_from_error(exc))
                     raise GantryAlarmError(
                         "Gantry entered an alarm state during jog. "
                         "Run limit recovery before continuing."
@@ -367,25 +500,149 @@ class GantrySession:
         z: float = 0.0,
         timeout_s: float = 10.0,
         feed_rate: float = 2000,
+        jog_id: str | None = None,
     ) -> GantryPositionSnapshot:
+        self._validate_jog_id(jog_id)
         self._require_connected()
         if x == 0 and y == 0 and z == 0:
             return self.position()
+        generation = self._jog_cancel_generation
         with self._lock:
+            if generation != self._jog_cancel_generation:
+                if jog_id is not None and self._calibration_jog_bypass_working_volume:
+                    raise GantryJogCancelledError("Calibration jog was cancelled before it started.")
+                return self._position_from_cache_with_status(self._extract_status())
+            if jog_id is not None and self._calibration_jog_bypass_working_volume:
+                return self._calibration_jog_blocking_locked(
+                    x=x, y=y, z=z, feed_rate=feed_rate, timeout_s=timeout_s,
+                    jog_id=jog_id, generation=generation,
+                )
             self._validate_jog_target_locked(x=x, y=y, z=z)
+            accepted = False
             try:
                 self._require_connected().jog(x=x, y=y, z=z, feed_rate=feed_rate)
+                self._record_accepted_jog_locked({"x": float(x), "y": float(y), "z": float(z)}, jog_id, generation)
+                accepted = True
                 self._wait_until_idle_locked(timeout_s=timeout_s)
+            except (JogAcceptanceUnknownError, MillConnectionError):
+                self._invalidate_jog_reference_locked()
+                raise
             except GantryAlarmError:
+                if not accepted:
+                    self._invalidate_jog_reference_locked()
                 raise
             except Exception as exc:
                 if self._looks_like_alarm_error(exc):
+                    if not accepted and any(token in str(exc).lower() for token in ("alarm", "check limits")):
+                        self._invalidate_jog_reference_locked()
+                    self._latch_alarm_locked(self._alarm_status_from_error(exc))
                     raise GantryAlarmError(
                         "Gantry entered an alarm state during blocking jog. "
                         "Run limit recovery before continuing."
                     ) from exc
                 raise
         return self.position()
+
+    def _calibration_jog_blocking_locked(
+        self, *, x: float, y: float, z: float, feed_rate: float,
+        timeout_s: float, jog_id: str, generation: int,
+    ) -> GantryPositionSnapshot:
+        self._validate_jog_target_locked(x=x, y=y, z=z)
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("Calibration jog timeout must be finite and positive.")
+        if not math.isfinite(feed_rate) or feed_rate <= 0:
+            raise ValueError("Calibration jog feed rate must be finite and positive.")
+        delta = {axis: round(float(value), 3) for axis, value in (("x", x), ("y", y), ("z", z))}
+        if not any(delta.values()):
+            raise ValueError("Calibration jog must move at least 0.001 mm.")
+        gantry = self._require_connected()
+        accepted = False
+        attempted = False
+
+        def check_cancelled() -> None:
+            if generation != self._jog_cancel_generation:
+                raise GantryJogCancelledError("Calibration jog was cancelled before completion.")
+
+        def read_position() -> tuple[dict[str, Any], str, dict[str, float]]:
+            check_cancelled()
+            info = gantry.get_calibration_position_info()
+            status = str(info.get("raw_status", info.get("status", "Unknown")))
+            if looks_like_limit_alarm(status):
+                raise GantryAlarmError(f"Calibration jog controller fault: {status}")
+            check_cancelled()
+            work_pos = info.get("work_pos")
+            if not isinstance(work_pos, dict) or not all(
+                axis in work_pos and math.isfinite(float(work_pos[axis]))
+                for axis in ("x", "y", "z")
+            ):
+                raise GantrySessionError("Calibration jog requires fresh finite work coordinates.")
+            return info, status, work_pos
+
+        try:
+            initial_info, status, start = read_position()
+            if not re.match(r"^<?idle(?:[|>]|$)", status, re.IGNORECASE):
+                raise GantrySessionError("Calibration jog requires verified Idle before the next step.")
+            self._clear_jog_history_locked()
+            target = {axis: start[axis] + delta[axis] for axis in delta}
+            steps = initial_info.get("step_mm", {})
+            if any(delta[axis] and abs(delta[axis]) < steps.get(axis, 0) / 2 for axis in delta):
+                raise ValueError("Calibration jog is smaller than the controller's step resolution.")
+            tolerance = {axis: 0.00101 + steps.get(axis, 0) / 2 for axis in delta}
+            check_cancelled()
+            attempted = True
+            observed_fault = gantry.jog_for_calibration(
+                **delta, feed_rate=feed_rate, check_cancelled=check_cancelled,
+            )
+            self._record_accepted_jog_locked(delta, jog_id, generation)
+            accepted = True
+            if observed_fault:
+                raise GantryAlarmError(f"Acknowledged calibration jog reported {observed_fault}")
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                info, status, work_pos = read_position()
+                endpoint_reached = all(
+                    abs(float(work_pos[axis]) - target[axis]) <= tolerance[axis] for axis in target
+                ) and all(
+                    (float(work_pos[axis]) - start[axis]) * delta[axis] > 0
+                    for axis in delta if delta[axis]
+                )
+                if re.match(r"^<?idle(?:[|>]|$)", status, re.IGNORECASE) and endpoint_reached:
+                    return self._read_position_locked(info=info)
+                if not re.match(r"^<?(?:idle|jog|run)(?:[|>]|$)", status, re.IGNORECASE):
+                    raise GantrySessionError(f"Calibration jog completion is unverified: {status}")
+                self._sleep(0.1)
+            raise GantrySessionError("Timed out verifying calibration jog completion; Home required.")
+        except Exception as exc:
+            if generation != self._jog_cancel_generation and not self._looks_like_alarm_error(exc):
+                try:
+                    info = gantry.get_calibration_position_info()
+                    status = str(info.get("raw_status", info.get("status", "Unknown")))
+                    pos = info.get("work_pos")
+                    if re.match(r"^<?idle(?:[|>]|$)", status, re.IGNORECASE) and not looks_like_limit_alarm(status) and isinstance(pos, dict) and all(
+                        axis in pos and math.isfinite(float(pos[axis])) for axis in delta
+                    ):
+                        self._clear_jog_history_locked()
+                        self._read_position_locked(info=info)
+                        raise GantryJogCancelledError("Calibration jog was cancelled before completion.") from exc
+                except GantryJogCancelledError:
+                    raise
+                except MillConnectionError:
+                    self._invalidate_jog_reference_locked()
+                    raise
+                except Exception:
+                    self.logger.debug("Cancelled calibration jog position could not be verified", exc_info=True)
+                self._invalidate_jog_reference_locked()
+            if self._looks_like_alarm_error(exc):
+                if not accepted:
+                    self._invalidate_jog_reference_locked()
+                self._latch_alarm_locked(self._alarm_status_from_error(exc))
+                raise GantryAlarmError(f"Calibration jog stopped at a controller fault: {exc}") from exc
+            if not attempted and isinstance(exc, (ValueError, GantrySessionError)):
+                raise
+            self._invalidate_jog_reference_locked()
+            if (accepted or isinstance(exc, JogAcceptanceUnknownError)) and not isinstance(exc, MillConnectionError):
+                gantry.jog_cancel()
+            raise
 
     def set_work_coordinates(
         self,
@@ -395,6 +652,7 @@ class GantrySession:
         z: float | None = None,
     ) -> GantryPositionSnapshot:
         with self._locked_gantry() as gantry:
+            self._require_verified_calibration_frame_locked()
             gantry.set_work_coordinates(x=x, y=y, z=z)
         return self.position()
 
@@ -425,6 +683,9 @@ class GantrySession:
                 tolerance_mm=tolerance_mm,
             )
             self._calibration_restore_soft_limits = False
+            self._restore_calibration_hard_limits_if_needed_locked(
+                keep_if_configured=True
+            )
             self._calibration_jog_bypass_working_volume = False
             if self._connected_gantry_config is not None:
                 grbl_settings = dict(
@@ -452,7 +713,17 @@ class GantrySession:
     def prepare_calibration_origin(self) -> GantryPositionSnapshot:
         with self._locked_gantry() as gantry:
             self._apply_calibration_grbl_baseline_locked()
-            gantry.home()
+            # Hard limits ($21) are the only motion backstop while soft
+            # limits are disabled below, and hobby controllers ship with
+            # them off — without this, a jog past a travel end grinds and
+            # silently skips steps, corrupting the calibration being taken.
+            # Enforced for the calibration window only; finalize/abort
+            # restore the prior value (finalize keeps $21=1 when the gantry
+            # YAML configures hard_limits).
+            if gantry.hard_limits_enabled() is False:
+                gantry.set_hard_limits_enabled(True)
+                self._calibration_restore_hard_limits = True
+            self._home_and_verify_locked(gantry)
             gantry.enforce_work_position_reporting()
             gantry.activate_work_coordinate_system("G54")
             gantry.clear_g92_offsets()
@@ -461,11 +732,14 @@ class GantrySession:
                 gantry.set_soft_limits_enabled(False)
                 self._calibration_restore_soft_limits = True
             self._calibration_jog_bypass_working_volume = True
+            self._calibration_frame_unverified = False
+            self._calibration_pending_config = None
+            self._calibration_warning = self._calibration_mismatch_warning(gantry, self._connected_gantry_config or {})
         return self.position()
 
     def calibration_home_and_center(self) -> CalibrationCenterResult:
         with self._locked_gantry() as gantry:
-            gantry.home()
+            self._home_and_verify_locked(gantry)
             bounds = {axis: float(value) for axis, value in dict(gantry.get_coordinates()).items()}
             center_x = round(float(bounds["x"]) / 2.0, 3)
             center_y = round(float(bounds["y"]) / 2.0, 3)
@@ -474,9 +748,12 @@ class GantrySession:
         return CalibrationCenterResult(xy_bounds=bounds, position=position)
 
     def restore_calibration_soft_limits(self) -> GantryPositionSnapshot:
-        with self._locked_gantry():
+        with self._locked_gantry() as gantry:
             self._restore_calibration_soft_limits_if_needed_locked()
+            self._restore_calibration_hard_limits_if_needed_locked()
             self._calibration_jog_bypass_working_volume = False
+            if not self._calibration_frame_unverified:
+                self._calibration_warning = self._calibration_mismatch_warning(gantry, self._connected_gantry_config or {})
         return self.position()
 
     def finalize_calibration_origin(
@@ -487,14 +764,19 @@ class GantrySession:
         block_height: float,
         factory_z_travel: float,
         tolerance_mm: float = 0.25,
+        origin_policy: str | None = None,
     ) -> FinalizeOriginResult:
         with self._locked_gantry() as gantry:
+            self._require_verified_calibration_frame_locked()
+            previous_policy = OriginPolicy((self._connected_gantry_config or {}).get("origin_policy", "deck_origin")).value
+            selected_policy = OriginPolicy(previous_policy if origin_policy is None else origin_policy).value
             try:
                 result = gantry.finalize_deck_origin_calibration(
                     home_z=home_z,
                     block_touch_z=block_touch_z,
                     block_height=block_height,
                     total_z_range=factory_z_travel,
+                    origin_policy=selected_policy,
                     status_report=0,
                     homing_pull_off=self._connected_grbl_setting_locked(
                         "homing_pull_off"
@@ -518,6 +800,9 @@ class GantrySession:
                 if homing_pull_off_mm is not None:
                     homing_pull_off_mm = float(homing_pull_off_mm)
                 self._calibration_restore_soft_limits = False
+                self._restore_calibration_hard_limits_if_needed_locked(
+                    keep_if_configured=True
+                )
                 self._calibration_jog_bypass_working_volume = False
                 if self._connected_gantry_config is not None:
                     grbl_settings = dict(
@@ -534,10 +819,20 @@ class GantrySession:
                     if homing_pull_off_mm is not None:
                         grbl_settings["homing_pull_off"] = homing_pull_off_mm
                     self._connected_gantry_config["grbl_settings"] = grbl_settings
+                    self._connected_gantry_config["working_volume"] = dict(result["working_volume"])
+                    self._connected_gantry_config["origin_policy"] = result["origin_policy"]
+                    cnc = dict(self._connected_gantry_config.get("cnc") or {})
+                    cnc["calibration_block_height_mm"] = result["z_calibration"]["block_height"]
+                    safe_z = translate_calibrated_safe_z(cnc.get("safe_z"), previous_policy, selected_policy, measured_volume["z"], result["working_volume"])
+                    cnc["safe_z"] = safe_z
+                    self._connected_gantry_config["cnc"] = cnc
+                    gantry.config = self._runtime_connect_config(self._connected_gantry_config)
                     self._calibration_warning = self._calibration_mismatch_warning(
                         gantry,
                         self._connected_gantry_config,
                     )
+                self._calibration_frame_unverified = False
+                self._calibration_pending_config = copy.deepcopy(self._connected_gantry_config)
                 self._last_position = GantryPositionSnapshot(
                     x=position["x"],
                     y=position["y"],
@@ -547,13 +842,15 @@ class GantrySession:
                     work_z=position["z"],
                     status="Idle",
                     connected=True,
-                    calibration_warning=self._calibration_warning,
+                    calibration_warning=self.calibration_warning,
                 )
             except Exception:
                 self._attempt_soft_limit_restore_after_calibration_failure_locked(
                     gantry
                 )
                 self._calibration_jog_bypass_working_volume = False
+                self._calibration_frame_unverified = True
+                self._calibration_warning = "Calibration origin did not verify. Restart full calibration before moving or running protocols."
                 raise
 
         return FinalizeOriginResult(
@@ -562,6 +859,65 @@ class GantrySession:
             max_travel=max_travel,
             position=position,
             homing_pull_off_mm=homing_pull_off_mm,
+            origin_policy=result["origin_policy"],
+            working_volume=dict(result["working_volume"]),
+            safe_z=safe_z,
+        )
+
+    def limit_recovery_context(self) -> LimitRecoveryContext:
+        """Read fresh limit pins and report recovery eligibility without actuating."""
+        with self._locked_gantry() as gantry:
+            return self._limit_recovery_context_locked(gantry)
+
+    def _limit_recovery_context_locked(self, gantry: Gantry) -> LimitRecoveryContext:
+        try:
+            status = str(gantry.get_recovery_status())
+        except Exception as exc:
+            if self._looks_like_alarm_error(exc):
+                self._latch_alarm_locked(self._alarm_status_from_error(exc))
+            raise
+        if looks_like_limit_alarm(status):
+            self._latch_alarm_locked(status)
+        self._retire_jog_ownership_after_idle_locked(status)
+        pins = re.search(r"Pn:([^|>;\s]*)", status, re.IGNORECASE)
+        axes = [axis for axis in ("x", "y", "z") if pins and axis in pins.group(1).lower()]
+        with self._jog_history_lock:
+            candidate = copy.deepcopy(self._failed_jog_delta)
+            failed_jog_id = self._failed_jog_id
+        ready = bool(re.match(r"^<?(?:idle|alarm)(?:[:|>]|$)", status, re.IGNORECASE))
+        only_matching_pin = bool(pins and len(axes) == 1 and set(pins.group(1).lower()) == set(axes))
+        manual_available = ready and only_matching_pin
+        moving_axes = [axis for axis in ("x", "y", "z") if candidate and candidate.get(axis)]
+        if not axes:
+            reason = "No active limit switch verified."
+        elif len(axes) != 1:
+            reason = "Multiple limit switches are active."
+        elif not ready:
+            reason = "Controller is not ready for recovery."
+        elif not only_matching_pin:
+            reason = "Unrelated input pins are active."
+        elif candidate is None:
+            reason = "The original jog direction is unknown."
+        elif len(moving_axes) != 1 or not all(math.isfinite(value) for value in candidate.values()):
+            reason = "The original jog was not a finite single-axis move."
+        elif moving_axes != axes:
+            reason = "The original jog does not match the active switch."
+        else:
+            reason = None
+        pull_off = None
+        if reason is None:
+            axis = axes[0]
+            pull_off = {key: 0.0 for key in ("x", "y", "z")}
+            pull_off[axis] = -5.0 if candidate[axis] > 0 else 5.0
+        return LimitRecoveryContext(
+            raw_status=status,
+            active_limit_axes=axes,
+            failed_jog_delta=candidate,
+            eligible=reason is None,
+            blocked_reason=reason,
+            pull_off_delta=pull_off,
+            manual_available=manual_available,
+            failed_jog_id=failed_jog_id,
         )
 
     def recover_calibration_limit(
@@ -571,19 +927,88 @@ class GantrySession:
         y: float = 0.0,
         z: float = 0.0,
         pull_off_mm: float = 5.0,
-        feed_rate: float = 2500.0,
+        feed_rate: float = 100.0,
+        jog_id: str | None = None,
     ) -> tuple[LimitRecoveryResult, list[str]]:
-        if x == 0 and y == 0 and z == 0:
-            raise ValueError("Limit recovery requires the failed jog delta.")
-        messages: list[str] = []
+        self._validate_jog_id(jog_id)
+        requested_delta = {"x": float(x), "y": float(y), "z": float(z)}
+        moving_axes = [axis for axis, value in requested_delta.items() if value]
+        if len(moving_axes) != 1 or not all(math.isfinite(value) for value in requested_delta.values()):
+            raise ValueError("Limit recovery requires a finite single-axis failed jog delta.")
+        if pull_off_mm != 5.0 or feed_rate != 100.0:
+            raise ValueError("Known-jog recovery uses one 5 mm pull-off at 100 mm/min.")
+        generation = self._jog_cancel_generation
         with self._locked_gantry() as gantry:
-            result = recover_from_limit_alarm(
-                gantry,
-                {"x": x, "y": y, "z": z},
-                pull_off_mm=pull_off_mm,
-                feed_rate=feed_rate,
-                output=messages.append,
+            with self._jog_history_lock:
+                self._validate_failed_jog_locked(requested_delta, jog_id)
+            alarm_was_clear = self._alarm_status is None
+            context = self._limit_recovery_context_locked(gantry)
+            generation += int(alarm_was_clear and self._alarm_status is not None)
+            if not context.eligible:
+                raise GantryAlarmError(context.blocked_reason)
+            with self._jog_history_lock:
+                self._validate_failed_jog_locked(requested_delta, jog_id)
+                self._last_jog_delta = self._failed_jog_delta = None
+                self._last_jog_id = self._failed_jog_id = None
+            return self._run_limit_recovery_locked(
+                gantry, requested_delta, axis=moving_axes[0], distance=5.0,
+                generation=generation, manual=False,
             )
+
+    def recover_calibration_limit_manual(
+        self,
+        *,
+        axis: str,
+        away_direction: int,
+        operator_confirmed: bool,
+    ) -> tuple[LimitRecoveryResult, list[str]]:
+        """Move one millimeter in an explicitly confirmed direction from a switch."""
+        if axis not in ("x", "y", "z"):
+            raise ValueError("Manual recovery axis must be x, y, or z.")
+        if isinstance(away_direction, bool) or away_direction not in (-1, 1):
+            raise ValueError("Manual recovery away_direction must be -1 or 1.")
+        if operator_confirmed is not True:
+            raise ValueError("Manual recovery requires explicit operator confirmation of the away direction.")
+        generation = self._jog_cancel_generation
+        with self._locked_gantry() as gantry:
+            alarm_was_clear = self._alarm_status is None
+            context = self._limit_recovery_context_locked(gantry)
+            generation += int(alarm_was_clear and self._alarm_status is not None)
+            if not context.manual_available or context.active_limit_axes != [axis]:
+                raise GantryAlarmError("Manual recovery requires only the confirmed axis switch to be active.")
+            delta = {key: 0.0 for key in ("x", "y", "z")}
+            delta[axis] = -float(away_direction)
+            self._clear_jog_history_locked()
+            return self._run_limit_recovery_locked(
+                gantry, delta, axis=axis, distance=1.0,
+                generation=generation, manual=True,
+            )
+
+    def _run_limit_recovery_locked(
+        self, gantry: Gantry, delta: dict[str, float], *, axis: str,
+        distance: float, generation: int, manual: bool,
+    ) -> tuple[LimitRecoveryResult, list[str]]:
+        messages: list[str] = []
+        try:
+            result = recover_from_limit_alarm(
+                gantry, delta, pull_off_mm=distance, feed_rate=100.0,
+                output=messages.append,
+                cancelled=lambda: generation != self._jog_cancel_generation,
+                confirmed_limit_axis=axis,
+                manual=manual,
+            )
+            if generation != self._jog_cancel_generation:
+                raise CommandExecutionError("Limit recovery cancelled before final verification.")
+            self._verify_operator_recovery_locked(recovery=True)
+            if generation != self._jog_cancel_generation:
+                raise CommandExecutionError("Limit recovery cancelled during final verification.")
+        except (JogAcceptanceUnknownError, MillConnectionError):
+            self._invalidate_jog_reference_locked()
+            raise
+        except Exception as exc:
+            if self._looks_like_alarm_error(exc):
+                self._latch_alarm_locked(self._alarm_status_from_error(exc))
+            raise
         return result, messages
 
     def run_protocol(
@@ -597,11 +1022,13 @@ class GantrySession:
         protocol_file: str,
         db_path: str | Path | None = None,
         fluid_state_id: int | None = None,
+        step_observer: Any | None = None,
     ) -> ProtocolRunResult:
         context = None
         data_store = None
         with self._lock:
             gantry = self._require_connected()
+            self._require_verified_calibration_frame_locked()
             # A GRBL-settings mismatch (self._calibration_warning) is advisory,
             # not blocking: commissioning machines legitimately differ from the
             # selected gantry YAML, and the operator owns that decision. The
@@ -628,8 +1055,21 @@ class GantrySession:
                     data_store=data_store,
                     campaign_id=campaign_id,
                     fluid_state_id=fluid_state_id,
+                    step_observer=step_observer,
                 )
-                gantry.prepare_for_protocol_run()
+                planning_enabled = (
+                    getattr(getattr(context, "deck", None), "planning_enabled", False)
+                    is True
+                )
+                if planning_enabled:
+                    status = gantry.get_status()
+                    if status != "Idle" and not status.startswith("<Idle|"):
+                        raise GantrySessionHealthCheckError(
+                            "Planning-enabled execution requires an Idle controller; "
+                            f"observed {status!r}. No motion was attempted."
+                        )
+                else:
+                    gantry.prepare_for_protocol_run()
                 context.gantry.connect_instruments()
                 if not gantry.is_healthy():
                     raise GantrySessionHealthCheckError(
@@ -649,10 +1089,14 @@ class GantrySession:
             results=results,
         )
 
-    def _move_worker(self, x: float, y: float, z: float) -> None:
+    def _move_worker(self, x: float, y: float, z: float, generation: int | None = None) -> None:
         self._move_error = None
         try:
             with self._lock:
+                if generation is not None and generation != self._jog_cancel_generation:
+                    return
+                self._validate_manual_move_target_locked(x=x, y=y, z=z)
+                self._clear_jog_history_locked()
                 self._require_connected().move_to(x=x, y=y, z=z)
         except Exception as exc:
             self.logger.error("Background move to (%s, %s, %s) failed: %s", x, y, z, exc, exc_info=True)
@@ -669,18 +1113,124 @@ class GantrySession:
     def _clear_connected_state_locked(self) -> None:
         self._gantry = None
         self._last_position = None
-        self._calibration_warning = None
+        if not self._calibration_frame_unverified:
+            self._calibration_warning = None
         self._connected_gantry_config = None
         self._connected_gantry_filename = None
         self._calibration_restore_soft_limits = False
+        self._calibration_restore_hard_limits = False
         self._calibration_jog_bypass_working_volume = False
         self._move_error = None
+        self._alarm_status = None
+        self._position_query_failed = False
+        self._clear_jog_history_locked()
 
-    def _read_position_locked(self) -> GantryPositionSnapshot:
+    def _home_and_verify_locked(self, gantry: Gantry) -> GantryPositionSnapshot:
+        self._clear_jog_history_locked()
+        self._position_reference_untrusted = True
+        self._homing_active = True
+        try:
+            gantry.home()
+            return self._verify_operator_recovery_locked(reference_restored=True)
+        finally:
+            self._homing_active = False
+
+    @staticmethod
+    def _validate_jog_id(jog_id: str | None) -> None:
+        if jog_id is not None and (not isinstance(jog_id, str) or not 1 <= len(jog_id) <= 128 or not jog_id.strip()):
+            raise ValueError("jog_id must be a nonempty string of at most 128 characters.")
+
+    def _clear_jog_history_locked(self, *, cancel: bool = False) -> None:
+        with self._jog_history_lock:
+            self._last_jog_delta = self._failed_jog_delta = None
+            self._last_jog_id = self._failed_jog_id = None
+            if cancel:
+                self._jog_cancel_generation += 1
+
+    def _cancel_jog_ownership(self) -> None:
+        with self._jog_history_lock:
+            self._jog_cancel_generation += 1
+            self._last_jog_id = self._failed_jog_id = None
+
+    def _retire_jog_ownership_after_idle_locked(self, status: str) -> None:
+        if re.match(r"^<?idle(?:[|>]|$)", status, re.IGNORECASE) and not looks_like_limit_alarm(status):
+            with self._jog_history_lock:
+                self._last_jog_id = self._failed_jog_id = None
+
+    def _record_accepted_jog_locked(self, delta: dict[str, float], jog_id: str | None, generation: int) -> None:
+        with self._jog_history_lock:
+            self._last_jog_delta = delta
+            self._last_jog_id = jog_id if generation == self._jog_cancel_generation else None
+
+    def _validate_failed_jog_locked(self, delta: dict[str, float], jog_id: str | None) -> None:
+        if self._failed_jog_delta != delta:
+            raise GantryAlarmError("Limit recovery requires the matching failed jog direction.")
+        if jog_id is not None and self._failed_jog_id != jog_id:
+            raise GantryAlarmError("Limit recovery jog_id does not match the authoritative failed jog.")
+
+    def _invalidate_jog_reference_locked(self) -> None:
+        self._clear_jog_history_locked(cancel=True)
+        self._position_reference_untrusted = True
+
+    def _latch_alarm_locked(self, status: str) -> None:
+        with self._jog_history_lock:
+            self._position_reference_untrusted = True
+            if self._alarm_status is None:
+                self._jog_cancel_generation += 1
+                self._alarm_status = status
+            else:
+                pins = re.search(r"Pn:[^|>;\s]*", status, re.IGNORECASE)
+                if pins and pins.group(0) not in self._alarm_status:
+                    self._alarm_status = f"{self._alarm_status}; {pins.group(0)}"
+            if self._failed_jog_delta is None and self._last_jog_delta is not None:
+                self._failed_jog_delta = dict(self._last_jog_delta)
+                self._failed_jog_id = self._last_jog_id
+
+    def _verify_operator_recovery_locked(self, *, reference_restored: bool = False, recovery: bool = False) -> GantryPositionSnapshot:
         gantry = self._require_connected()
-        info = gantry.get_position_info()
+        status = str(gantry.get_recovery_status() if recovery else gantry.get_status())
+        if looks_like_limit_alarm(status):
+            self._latch_alarm_locked(status)
+            raise GantryAlarmError(f"Controller recovery did not clear the fault: {status}")
+        if not re.match(r"^<?idle(?:[|>]|$)", status, re.IGNORECASE):
+            raise GantrySessionError(f"Controller recovery is unverified: {status}")
+        info = gantry.get_recovery_position_info() if recovery else gantry.get_position_info()
+        raw_status = str(info.get("raw_status", info.get("status", "Unknown")))
+        if looks_like_limit_alarm(raw_status):
+            self._latch_alarm_locked(raw_status)
+            raise GantryAlarmError(f"Controller recovery did not clear the fault: {raw_status}")
+        wpos = info.get("work_pos")
+        if (
+            not re.match(r"^<?idle(?:[|>]|$)", raw_status, re.IGNORECASE)
+            or not isinstance(wpos, dict)
+            or not all(math.isfinite(float(wpos[axis])) for axis in ("x", "y", "z"))
+        ):
+            raise GantrySessionError("Controller recovery needs verified Idle status and current coordinates.")
+        if reference_restored and not self._calibration_frame_unverified:
+            self._calibration_warning = self._calibration_mismatch_warning(gantry, self._connected_gantry_config or {})
+        self._alarm_status = None
+        self._position_query_failed = False
+        if reference_restored:
+            self._position_reference_untrusted = False
+            self._homing_active = False
+        self._clear_jog_history_locked()
+        return self._read_position_locked(info=info)
+
+    def _read_position_locked(self, *, info: dict[str, Any] | None = None) -> GantryPositionSnapshot:
+        gantry = self._require_connected()
+        if info is None:
+            info = gantry.get_position_info()
+        raw_status = str(info.get("raw_status", info["status"]))
+        if looks_like_limit_alarm(raw_status):
+            self._latch_alarm_locked(raw_status)
+        self._retire_jog_ownership_after_idle_locked(raw_status)
+        if self._alarm_status is not None or self._position_reference_untrusted or self._homing_active:
+            return self._position_from_cache_with_status(self._alarm_status or "Home required")
+        if re.match(r"^<?idle(?:[|>]|$)", raw_status, re.IGNORECASE):
+            self._clear_jog_history_locked()
         coords = info["coords"]
         wpos = info["work_pos"]
+        self._position_query_failed = False
         self._last_position = GantryPositionSnapshot(
             x=float(coords["x"]),
             y=float(coords["y"]),
@@ -690,29 +1240,40 @@ class GantrySession:
             work_z=float(wpos["z"]) if wpos else None,
             status=str(info["status"]),
             connected=True,
-            calibration_warning=self._calibration_warning,
+            calibration_warning=self.calibration_warning,
             move_error=self._move_error,
         )
         return self._last_position
 
     def _position_from_cache_with_status(self, status: str) -> GantryPositionSnapshot:
+        if looks_like_limit_alarm(status):
+            self._latch_alarm_locked(status)
+        if self._alarm_status is not None:
+            status = self._alarm_status
+        elif self._homing_active:
+            status = "Homing"
+        elif self._position_reference_untrusted:
+            status = "Home required"
+        elif self._position_query_failed:
+            status = "Query failed"
+        coordinates_unknown = self._position_reference_untrusted or self._homing_active or status == "Query failed"
         if self._last_position is not None:
             return GantryPositionSnapshot(
                 x=self._last_position.x,
                 y=self._last_position.y,
                 z=self._last_position.z,
-                work_x=self._last_position.work_x,
-                work_y=self._last_position.work_y,
-                work_z=self._last_position.work_z,
+                work_x=None if coordinates_unknown else self._last_position.work_x,
+                work_y=None if coordinates_unknown else self._last_position.work_y,
+                work_z=None if coordinates_unknown else self._last_position.work_z,
                 status=status,
                 connected=True,
-                calibration_warning=self._calibration_warning,
+                calibration_warning=self.calibration_warning,
                 move_error=self._move_error,
             )
         return GantryPositionSnapshot(
             connected=True,
             status=status,
-            calibration_warning=self._calibration_warning,
+            calibration_warning=self.calibration_warning,
             move_error=self._move_error,
         )
 
@@ -732,6 +1293,8 @@ class GantrySession:
 
         try:
             live = gantry.read_grbl_settings()
+        except MillConnectionError:
+            raise
         except Exception as exc:
             return (
                 "Calibration status unknown: connected, but CubOS could not "
@@ -779,6 +1342,30 @@ class GantrySession:
         except (KeyError, TypeError, ValueError):
             return None
 
+    def _matches_pending_calibration_locked(self, config: dict[str, Any]) -> bool:
+        expected = self._calibration_pending_config
+        if expected is None:
+            return True
+        return (
+            config.get("origin_policy", "deck_origin") == expected.get("origin_policy", "deck_origin")
+            and config.get("working_volume") == expected.get("working_volume")
+            and (config.get("cnc") or {}).get("safe_z") == (expected.get("cnc") or {}).get("safe_z")
+            and all((config.get("grbl_settings") or {}).get(key) == (expected.get("grbl_settings") or {}).get(key)
+                    for key in ("max_travel_x", "max_travel_y", "max_travel_z", "homing_pull_off"))
+        )
+
+    def _require_verified_calibration_frame_locked(self) -> None:
+        if self._alarm_status is not None:
+            raise GantryAlarmError(
+                f"Controller fault remains active: {self._alarm_status}. Verify recovery before moving."
+            )
+        if self._position_reference_untrusted:
+            raise CalibrationBlockedError("Position reference is unverified after a controller fault. Home before moving or capturing calibration.")
+        if self._calibration_pending_config is not None:
+            raise CalibrationBlockedError("Save the finalized calibration before moving or running protocols.")
+        if self._calibration_frame_unverified:
+            raise CalibrationBlockedError("Calibration origin did not verify. Restart full calibration before moving or running protocols.")
+
     def _validate_manual_move_target_locked(
         self,
         *,
@@ -786,6 +1373,7 @@ class GantrySession:
         y: float,
         z: float,
     ) -> None:
+        self._require_verified_calibration_frame_locked()
         for axis, value in (("X", x), ("Y", y), ("Z", z)):
             if not math.isfinite(float(value)):
                 raise ValueError(f"Manual move {axis} target must be finite.")
@@ -812,6 +1400,7 @@ class GantrySession:
             )
 
     def _validate_jog_target_locked(self, *, x: float, y: float, z: float) -> None:
+        self._require_verified_calibration_frame_locked()
         for axis, value in (("X", x), ("Y", y), ("Z", z)):
             if not math.isfinite(float(value)):
                 raise ValueError(f"Jog {axis} delta must be finite.")
@@ -843,6 +1432,11 @@ class GantrySession:
 
     def _current_work_position_locked(self) -> dict[str, float]:
         info = self._require_connected().get_position_info()
+        raw_status = str(info.get("raw_status", info.get("status", "Unknown")))
+        if looks_like_limit_alarm(raw_status):
+            self._latch_alarm_locked(raw_status)
+            raise GantryAlarmError(f"Controller fault prevents jogging: {raw_status}")
+        self._retire_jog_ownership_after_idle_locked(raw_status)
         raw = info.get("work_pos") or info.get("coords")
         if not isinstance(raw, dict):
             raise MovementOutOfBoundsError(
@@ -870,13 +1464,15 @@ class GantrySession:
         while time.monotonic() < deadline:
             last_status = str(self._require_connected().get_status())
             lowered = last_status.lower()
-            if "idle" in lowered:
-                return
             if looks_like_limit_alarm(lowered):
+                self._latch_alarm_locked(last_status)
                 raise GantryAlarmError(
                     "Gantry entered an alarm state while waiting for motion "
                     "to finish. Run limit recovery before continuing."
                 )
+            if re.match(r"^<?idle(?:[|>]|$)", lowered):
+                self._retire_jog_ownership_after_idle_locked(last_status)
+                return
             if "error" in lowered:
                 raise GantrySessionError(
                     f"Gantry entered {last_status} while waiting for motion "
@@ -908,6 +1504,34 @@ class GantrySession:
             raise GantrySessionError(
                 "Soft-limit restore did not verify $20=1 on the controller."
             )
+
+    def _restore_calibration_hard_limits_if_needed_locked(
+        self,
+        *,
+        keep_if_configured: bool = False,
+    ) -> None:
+        """Undo the calibration-window $21=1 enforcement.
+
+        Only runs when prepare actually flipped $21 on (the flag). With
+        ``keep_if_configured`` (the finalize path), a gantry YAML that
+        configures ``hard_limits`` keeps $21=1 permanently instead of
+        reverting. A failed revert is logged, not raised — the machine is
+        left in the safer state.
+        """
+        if self._gantry is None or not self._calibration_restore_hard_limits:
+            return
+        if keep_if_configured and self._connected_grbl_setting_locked("hard_limits"):
+            self._calibration_restore_hard_limits = False
+            return
+        try:
+            self._gantry.set_hard_limits_enabled(False)
+        except Exception as exc:
+            self.logger.warning(
+                "Could not restore pre-calibration $21=0 (hard limits stay "
+                "enabled): %s",
+                exc,
+            )
+        self._calibration_restore_hard_limits = False
 
     def _attempt_soft_limit_restore_after_calibration_failure_locked(
         self,
@@ -1016,7 +1640,11 @@ class _LockedGantry:
 
     def __enter__(self) -> Gantry:
         self._session._lock.acquire()
-        return self._session._require_connected()
+        try:
+            return self._session._require_connected()
+        except BaseException:
+            self._session._lock.release()
+            raise
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self._session._lock.release()

@@ -11,6 +11,22 @@ export interface Coordinate2D {
   y: number;
 }
 
+export interface MotionBox {
+  anchor: "A1" | "location";
+  offset: Coordinate3D;
+  size: Coordinate3D;
+}
+
+export interface MotionAccess {
+  strategy: "vertical";
+}
+
+export interface LabwareMotion {
+  box: MotionBox;
+  occupied_tip_radius_mm?: number;
+  access?: Partial<Record<"move" | "pick_up_tip" | "transfer" | "mix" | "drop_tip", MotionAccess>>;
+}
+
 export interface CalibrationPoints {
   a1: Coordinate3D | null;
   a2: Coordinate3D;
@@ -31,6 +47,7 @@ export interface WellPlateConfig {
   y_offset: number;
   capacity_ul?: number | null;
   working_volume_ul?: number | null;
+  motion?: LabwareMotion;
 }
 
 export interface VialConfig {
@@ -42,8 +59,38 @@ export interface VialConfig {
   location: Coordinate3D;
   capacity_ul: number;
   working_volume_ul: number;
+  motion?: LabwareMotion;
 }
 
+export interface VialGridConfig {
+  type: "vial_grid";
+  name: string;
+  model_name: string;
+  rows: number;
+  columns: number;
+  calibration: CalibrationPoints;
+  x_offset: number;
+  y_offset: number;
+  row_direction?: "positive" | "negative" | null;
+  vial_model_name?: string;
+  vial_height?: number | null;
+  vial_diameter?: number | null;
+  capacity_ul: number;
+  working_volume_ul: number;
+  [key: string]: unknown;
+  motion?: LabwareMotion;
+}
+
+// Mirrors TipRackYamlEntry: tip positions derive from a two-point XY
+// calibration + pitch offsets; every tip's Z comes from pickup_z, so
+// calibration points carry no meaningful z.
+export interface TipRackCalibration {
+  a1: Coordinate2D | Coordinate3D | null;
+  a2: Coordinate2D | Coordinate3D;
+}
+
+// Core fields are optional because a raw-YAML entry may use load_name and
+// provide only calibration + pickup_z; the definition supplies the rest.
 export interface TipRackConfig {
   type: "tip_rack";
   name: string;
@@ -51,10 +98,17 @@ export interface TipRackConfig {
   load_name?: string;
   rows?: number;
   columns?: number;
-  z_pickup?: number;
-  z_drop?: number;
-  tips?: Record<string, WellPosition>;
+  pickup_z?: number;
+  drop_z?: number | null;
+  tip_length?: number;
+  calibration?: TipRackCalibration;
+  x_offset?: number;
+  y_offset?: number;
   tip_present?: Record<string, boolean>;
+  location?: Coordinate3D | null;
+  length?: number | null;
+  width?: number | null;
+  height?: number | null;
   [key: string]: unknown;
 }
 
@@ -112,16 +166,23 @@ export interface TipDisposalConfig {
   name: string;
   model_name?: string;
   location?: Coordinate3D;
+  length?: number | null;
+  width?: number | null;
+  height?: number | null;
   [key: string]: unknown;
 }
 
 export type UnsupportedDeckConfig =
-  | TipRackConfig
   | WellPlateHolderConfig
-  | VialHolderConfig
-  | TipDisposalConfig;
+  | VialHolderConfig;
 
-export type LabwareConfig = WellPlateConfig | VialConfig | UnsupportedDeckConfig;
+export type LabwareConfig =
+  | WellPlateConfig
+  | VialConfig
+  | VialGridConfig
+  | TipRackConfig
+  | TipDisposalConfig
+  | UnsupportedDeckConfig;
 
 export interface WellPosition {
   x: number;
@@ -147,10 +208,12 @@ export interface LabwareResponse {
 export interface DeckResponse {
   filename: string;
   labware: LabwareResponse[];
+  motion_planning?: { clearance_mm: number } | null;
 }
 
 export interface DeckConfig {
   labware: Record<string, LabwareConfig>;
+  motion_planning?: { clearance_mm: number };
 }
 
 export interface InstrumentConfig {
@@ -159,6 +222,7 @@ export interface InstrumentConfig {
   offset_x: number;
   offset_y: number;
   depth?: number;
+  offline?: boolean;
   [key: string]: unknown;
 }
 
@@ -206,7 +270,7 @@ export type OriginPolicy = "deck_origin" | "home_origin";
 
 export interface GantryConfig {
   serial_port: string;
-  gantry_type: "cub" | "cub_xl";
+  gantry_type: "cub" | "cub_xl" | "genmitsu_4040_pro_max";
   cnc: CncConfig;
   working_volume: WorkingVolume;
   grbl_settings?: GrblSettingsConfig | null;
@@ -251,6 +315,9 @@ export interface ZCalibrationSummary {
 }
 
 export interface FinalizeOriginResponse {
+  safe_z: number;
+  origin_policy: "deck_origin" | "home_origin";
+  working_volume: WorkingVolume;
   measured_volume: Coordinate3D;
   z_calibration: ZCalibrationSummary;
   max_travel: Coordinate3D;
@@ -313,6 +380,18 @@ export type InstrumentSchemas = Record<string, Record<string, InstrumentFieldInf
 
 export type InstrumentMeasurementMethods = Record<string, string[]>;
 
+export interface InstrumentMethodParamField {
+  name: string;
+  type: string;
+  required: boolean;
+  default: unknown;
+  fields: InstrumentMethodParamField[] | null;
+}
+
+// type -> method -> ordered method_kwargs parameter specs. A param with
+// non-null `fields` is a dataclass the engine builds from a nested mapping.
+export type InstrumentMethodParams = Record<string, Record<string, InstrumentMethodParamField[]>>;
+
 // Protocol
 
 export interface CommandArg {
@@ -373,6 +452,50 @@ export interface RunRecord {
   error: string | null;
   artifacts: string[];
   fluid_state_id: number | null;
+}
+
+// Step-execution progress. `kind`/`data` are additive on RunEvent: events
+// written before they existed default to "lifecycle"/null, and an unknown
+// future kind must be ignored rather than treated as an error.
+export type RunEventKind = "lifecycle" | "step";
+
+export type StepOutcome = "started" | "completed" | "failed" | "skipped";
+
+export interface StepEventData {
+  index: number;
+  command: string;
+  /** Colon-joined nested scope for compound commands, e.g. "leg2:fill". */
+  substep: string | null;
+  outcome: StepOutcome;
+  duration_s: number | null;
+  error: string | null;
+  reason: string | null;
+}
+
+export interface RunEvent {
+  sequence: number;
+  timestamp: number;
+  state: RunState;
+  message: string;
+  kind: RunEventKind;
+  data: Record<string, unknown> | null;
+}
+
+export interface RunEventsResponse {
+  run_id: string;
+  events: RunEvent[];
+}
+
+export interface PlanStep {
+  index: number;
+  command: string;
+  summary: string;
+  args: Record<string, unknown>;
+}
+
+export interface RunPlanResponse {
+  run_id: string;
+  steps: PlanStep[];
 }
 
 export interface FluidSeedItem {

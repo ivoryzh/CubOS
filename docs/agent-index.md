@@ -14,7 +14,8 @@ Read before changing motion, coordinates, bounds, homing, session ownership, or 
 
 Setup and calibration flows should route through public `Gantry` APIs. Long-lived UI/API runtimes such as CubOS should route through `GantrySession`. Do not import `Mill` or `gantry_driver` internals from user-facing scripts.
 
-Gantry YAML requires top-level `gantry_type` (`cub` or `cub_xl`).
+Gantry YAML requires top-level `gantry_type` (`cub`, `cub_xl`, or
+`genmitsu_4040_pro_max`).
 
 Setup bounds validation checks the concrete motion targets implied by the loaded protocol, not every physical geometry anchor or unused labware point on the deck.
 
@@ -50,7 +51,8 @@ After schema/config changes: focused tests, then `packages/core/src/cubos/tools/
   `protocol_engine.is_measurement_result`.
 - Gantry YAML keeps `type` + `vendor`; `registry.py` resolves the concrete class, merges installed `cubos.instrument_registries` entry points, and then merges `CUBOS_INSTRUMENT_REGISTRY_PATHS` overlays.
 - `packages/core/src/cubos/protocol_engine/measurements.py`, `packages/core/src/cubos/data/data_store.py` - persisted measurements.
-- `packages/core/src/cubos/data/protocol_runs.py`, `packages/core/src/cubos/data/exports.py` - campaign creation for CubOS-owned protocol sessions and CubOS-compatible result summaries/ZIP exports.
+- `packages/core/src/cubos/data/protocol_runs.py`, `packages/core/src/cubos/data/exports.py` - campaign creation for CubOS-owned protocol sessions and CubOS-compatible result summaries/CSV exports.
+- `packages/core/src/cubos/data/download.py` - the Operator "Download Data" ZIP: raw recorded data as plain CSVs, no analysis.
 - Tests: `packages/core/tests/instruments/`, `packages/core/tests/protocol_engine/`, `packages/core/tests/data/`.
 
 ## Calibration scripts

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import List, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -19,6 +20,7 @@ from cubos.validation.errors import BoundsViolation, SetupValidationError
 from tests.api_client import api_request
 from cubos_api.app import create_app
 from cubos_api.config import get_settings
+from cubos_api.routers.protocol import _type_name
 from cubos_api.services.yaml_io import read_yaml, write_yaml
 
 
@@ -72,6 +74,28 @@ def test_get_single_command(client):
     assert "speed" in arg_names
 
 
+def test_transfer_command_exposes_travel_clearance_metadata(client):
+    response = api_request(client, "GET", "/api/v1/protocol/commands/transfer")
+    assert response.status_code == 200
+    clearance = next(
+        arg for arg in response.json()["args"] if arg["name"] == "travel_clearance"
+    )
+    assert clearance["default"] == 3.0
+    assert clearance["required"] is False
+    assert clearance["type"] == "float | None"
+    assert "registered plate top" in clearance["description"]
+    assert "null" in clearance["description"]
+
+
+def test_type_name_formats_union_annotations_and_preserves_generic_formatting():
+    assert _type_name(Optional[float]) == "float | None"
+    assert _type_name(float | None) == "float | None"
+    assert _type_name(float | int) == "float | int"
+    for annotation in (List[int], list[int]):
+        legacy_name = getattr(annotation, "__name__", None) or str(annotation)
+        assert _type_name(annotation) == legacy_name
+
+
 def test_get_unknown_command(client):
     response = api_request(client, "GET", "/api/v1/protocol/commands/nonexistent")
     assert response.status_code == 404
@@ -95,6 +119,47 @@ def test_get_protocol(client, tmp_configs):
     assert data["steps"][0]["command"] == "move"
     assert data["steps"][1]["command"] == "aspirate"
     assert data["steps"][1]["args"]["volume_ul"] == 100.0
+
+
+def test_get_protocol_preserves_repeat_block(client, tmp_configs):
+    write_yaml(tmp_configs / "repeat.yaml", {"protocol": [{"repeat": {
+        "labware": "plate", "template_well": "A1", "wells": ["A1", "A2"],
+        "steps": [{"move": {"instrument": "pipette", "position": "plate.A1"}}],
+    }}]})
+    response = api_request(client, "GET", "/api/v1/protocol/repeat.yaml")
+    assert response.status_code == 200
+    step = response.json()["steps"][0]
+    assert step == {"command": "repeat", "args": {
+        "labware": "plate", "template_well": "A1", "wells": ["A1", "A2"],
+        "steps": [{"command": "move", "args": {"instrument": "pipette", "position": "plate.A1"}}],
+    }}
+
+
+def test_save_protocol_keeps_repeat_native_in_yaml(client, tmp_configs):
+    body = {"protocol": [{"command": "repeat", "args": {
+        "labware": "plate", "template_well": "A1", "wells": ["A1", "A2"],
+        "steps": [{"command": "move", "args": {"instrument": "pipette", "position": "plate.A1"}}],
+    }}]}
+    response = api_request(client, "PUT", "/api/v1/protocol/repeat.yaml", json=body)
+    assert response.status_code == 200
+    saved = read_yaml(tmp_configs / "repeat.yaml")
+    assert saved["protocol"] == [{"repeat": {
+        "labware": "plate", "template_well": "A1", "wells": ["A1", "A2"],
+        "steps": [{"move": {"instrument": "pipette", "position": "plate.A1"}}],
+    }}]
+
+
+def test_save_protocol_rejects_nested_normalized_repeat(client, tmp_configs):
+    body = {"protocol": [{"command": "repeat", "args": {
+        "labware": "plate", "template_well": "A1", "wells": ["A1"],
+        "steps": [{"command": "repeat", "args": {
+            "labware": "plate", "template_well": "A1", "wells": ["A1"],
+            "steps": [{"command": "move", "args": {"instrument": "pipette", "position": "plate.A1"}}],
+        }}],
+    }}]}
+    response = api_request(client, "PUT", "/api/v1/protocol/nested.yaml", json=body)
+    assert response.status_code == 400
+    assert "nested repeat" in response.text
 
 
 def test_get_protocol_errors(client, tmp_configs):
@@ -266,7 +331,32 @@ def test_validate_protocol_ok(client):
     assert response.status_code == 200
     data = response.json()
     assert data["valid"] is True
-    assert data["errors"] == []
+
+
+def test_validate_protocol_expands_repeat_before_schema_validation(client):
+    response = api_request(client, "POST", "/api/v1/protocol/validate", json={"protocol": [{
+        "command": "repeat", "args": {
+            "labware": "plate", "template_well": "A1", "wells": ["A1", "A2"],
+            "steps": [{"command": "move", "args": {"instrument": "pipette", "position": "plate.A1"}}],
+        },
+    }]})
+    assert response.status_code == 200
+    assert response.json() == {"valid": True, "errors": []}
+
+
+def test_validate_protocol_rejects_nested_normalized_repeat(client):
+    response = api_request(client, "POST", "/api/v1/protocol/validate", json={"protocol": [{
+        "command": "repeat", "args": {
+            "labware": "plate", "template_well": "A1", "wells": ["A1"],
+            "steps": [{"command": "repeat", "args": {
+                "labware": "plate", "template_well": "A1", "wells": ["A1"],
+                "steps": [{"command": "move", "args": {"instrument": "pipette", "position": "plate.A1"}}],
+            }}],
+        },
+    }]})
+    assert response.status_code == 200
+    assert response.json()["valid"] is False
+    assert "nested repeat" in response.json()["errors"][0]
 
 
 def test_validate_protocol_unknown_command(client):
@@ -781,3 +871,32 @@ def test_cancel_endpoint_maps_unexpected_errors(monkeypatch):
 
     assert response.status_code == 500
     assert "Cancel failed" in response.text
+
+
+def test_delete_protocol_removes_file_and_404s_when_missing(monkeypatch, tmp_path):
+    config_dir = tmp_path / "configs"
+    protocol_dir = config_dir / "protocol"
+    protocol_dir.mkdir(parents=True)
+    (protocol_dir / "old.yaml").write_text("protocol:\n  - home:\n", encoding="utf-8")
+    monkeypatch.setattr(get_settings(), "config_dir", config_dir)
+    app = create_app()
+
+    response = api_request(app, "DELETE", "/api/v1/protocol/old.yaml")
+    assert response.status_code == 200
+    assert response.json() == {"status": "deleted", "filename": "old.yaml"}
+    assert not (protocol_dir / "old.yaml").exists()
+    assert api_request(app, "DELETE", "/api/v1/protocol/old.yaml").status_code == 404
+
+
+def test_delete_protocol_refused_while_run_active(monkeypatch, tmp_path):
+    from cubos_api.routers import gantry as gantry_router
+
+    config_dir = tmp_path / "configs"
+    protocol_dir = config_dir / "protocol"
+    protocol_dir.mkdir(parents=True)
+    (protocol_dir / "busy.yaml").write_text("protocol:\n  - home:\n", encoding="utf-8")
+    monkeypatch.setattr(get_settings(), "config_dir", config_dir)
+    monkeypatch.setattr(gantry_router, "run_active", lambda: True)
+
+    assert api_request(create_app(), "DELETE", "/api/v1/protocol/busy.yaml").status_code == 409
+    assert (protocol_dir / "busy.yaml").exists()

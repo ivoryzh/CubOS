@@ -33,7 +33,9 @@ for it.
 
 - **`deck_origin`** (default) — the [Coordinate Convention](#coordinate-convention)
   above: work-position zero sits at the front-left-bottom deck corner.
-  `working_volume` has `x_min: 0.0`, `y_min: 0.0`, and non-negative `z_min`;
+  `working_volume` normally starts at `x_min: 0.0`, `y_min: 0.0`, and a
+  non-negative `z_min`. A negative X/Y minimum is allowed when the machine
+  has verified clear travel beyond the deck corner;
   homing drives to the back-right-top corner, whose work position equals the
   `working_volume` maxima.
 - **`home_origin`** — work-position zero sits at the homed back-right-top
@@ -131,7 +133,9 @@ Use this file when:
 ## CNC Fields
 
 `gantry_type` is required at the gantry YAML root and identifies the physical
-machine family. Supported values are `cub` and `cub_xl`.
+machine family. Supported values are `cub`, `cub_xl`, and
+`genmitsu_4040_pro_max`. The 4040-PRO MAX has its own type because its
+400 x 400 mm frame does not share the Cub XL / PROVerXL 4030 fixed geometry.
 
 `factory_z_travel_mm` is required and must be greater than zero. It is the
 out-of-box vertical travel range for the gantry family/workcell and is not
@@ -161,8 +165,8 @@ requirements below describe the default `deck_origin` policy; under
 
 Protocol setup requires (`deck_origin`, the default):
 
-- `x_min: 0.0`
-- `y_min: 0.0`
+- `x_min <= 0.0`
+- `y_min <= 0.0`
 - non-negative `z_min`
 
 Use [Calibration](calibration.md) to measure the physical working
@@ -235,6 +239,27 @@ default for this collision-critical dimension.
 Legacy names `entry_travel_z`, `entry_travel_height`,
 `interwell_travel_height`, `safe_approach_height`, `indentation_limit`,
 and ASMI `z_limit` are rejected before motion.
+
+## Motion completion and status polling
+
+CubOS asks GRBL for a status report before waiting for the reply. The first
+regular status query is immediate; subsequent regular queries on the same
+connection are spaced at least 200 ms apart (5 Hz). This avoids waiting for
+the serial read timeout before asking whether a short move has finished.
+The controller's feed rate, acceleration, calibration and movement path are
+unchanged.
+
+An `ok` acknowledges a command; it does not confirm that motion has finished.
+CubOS waits for a controller `Idle` report. Informational messages containing
+the word "idle" do not complete a move, and Hold or alarm states are not
+successful completion. Real-time feed hold is sent immediately, without
+waiting for the regular polling interval.
+
+Status-query retries and reply processing are bounded. A silent or disconnected
+controller can still take time to report an error because the serial timeout
+is preserved. This is not a guaranteed stop-response time or a hardware timing
+benchmark. The query cadence follows the
+[GRBL interface guidance](https://github.com/gnea/grbl/blob/master/doc/markdown/interface.md#status-reporting).
 
 ## Controller Bring-Up
 

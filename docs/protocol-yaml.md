@@ -3,6 +3,14 @@
 YAML is the standard operator-facing protocol format and the path used by the
 stock validation and run scripts.
 
+For complete workflow configurations and experiment recipes, use the
+[CubOS Protocol Library](https://github.com/Ursa-Laboratories/CubOS-Protocol-Library).
+The [Polar Bear files](https://github.com/Ursa-Laboratories/CubOS-Protocol-Library/tree/main/cubxl_plus/polar_bear)
+are maintained there with their provenance and validation status. See
+[YAML File Overview](configuration.md) for the directory layout and Operator
+configuration. The bundled paths used in the examples below remain available
+for learning and offline checks.
+
 ## Before You Validate and Run
 
 Check these before every run, not just the first one of the day:
@@ -53,6 +61,31 @@ Each list entry is a single command keyed by its name (see
 [Protocol command reference](#protocol-command-reference) below). The schema is
 strict — an unknown key under a command is rejected.
 
+Use `repeat` to keep one authored set of commands and apply it to several wells:
+
+```yaml
+protocol:
+  - repeat:
+      labware: plate
+      template_well: A1
+      wells: [A1, A2, A3]
+      steps:
+        - move:
+            instrument: pipette
+            position: plate.A1
+        - aspirate:
+            position: plate.A1
+            volume_ul: 100
+```
+
+`labware` may be a top-level labware id or nested path. Each target in `wells`
+must exist on that well plate. Within `steps`, exact string values matching
+`<labware>.<template_well>` are changed to the corresponding target; strings
+that only contain that text are left alone. A non-empty `label` argument gets
+the target well appended (for example, `sample_A2`). Repeat blocks need at
+least one target and one step; targets must be unique, and nesting repeats is
+not supported. Expanded protocols are limited to 1,000 concrete steps.
+
 ## Validate offline
 
 Run `packages/core/src/cubos/tools/validate_setup.py` before connecting hardware, using the exact
@@ -86,11 +119,12 @@ python -m cubos.tools.run_protocol \
 the gantry and instruments, health-checks them, runs the protocol steps, and
 disconnects when done. Measurement results are saved automatically.
 
-By default, measurement rows are written to `data/databases/panda_data.db`.
+By default, measurement rows are written to `~/.cubos/panda_data.db`.
 Set `CUBOS_DATA_DB_PATH` to choose a different SQLite file for a run.
-After a successful run, the CLI also writes analysis-friendly CSV exports under
-`data/results/`. Array-based instruments such as UV-Vis, ASMI, and potentiostat
-are flattened into one row per wavelength/sample point.
+After a successful run, the CLI also prints the paths of its analysis-friendly
+CSV exports. For an editable source install, these are under
+`packages/core/src/cubos/data/results/`. Array-based instruments such as UV-Vis,
+ASMI, and potentiostat are flattened into one row per wavelength/sample point.
 
 ## Instruments
 
@@ -115,21 +149,36 @@ Two conventions apply throughout:
 - **Height arguments** (`measurement_height`, `interwell_scan_height`, pipette
   `height`, …) are labware-relative offsets in mm: positive is above the
   labware surface Z, negative is below.
+- **Lateral offsets** (`x_offset_mm` and `y_offset_mm`) are signed millimetre
+  adjustments from the resolved target: positive follows the gantry's +X/+Y
+  direction and negative follows -X/-Y. `move`, `measure`, `scan`, `cure`,
+  `cap`, `decap`, and the direct pipette commands support them. Transfers use
+  `source_x_offset_mm`/`source_y_offset_mm` and
+  `destination_x_offset_mm`/`destination_y_offset_mm`.
+
+These command fields belong to the shared CubOS protocol engine. They are
+available to every station and vendor using the corresponding generic command.
+Station-specific values, mounting calibrations, and workflow recipes belong
+in the [protocol library](https://github.com/Ursa-Laboratories/CubOS-Protocol-Library).
 
 Commands available in YAML:
 
 - `home`
 - `move`
 - `measure`
+- `rinse`
 - `scan`
 - `pause`
 - `breakpoint`
 - `pick_up_tip`
 - `aspirate`
+- `dispense`
 - `blowout`
+- `pipette_home`
 - `mix`
 - `transfer`
 - `serial_transfer`
+- `multi_dispense`
 - `drop_tip`
 - `rinse_well`
 - `flush_pipette`
@@ -137,12 +186,33 @@ Commands available in YAML:
 - `clear_well`
 - `decap`
 - `cap`
+- `set_lights`
+- `capture`
+- `image_well`
 
 ### `home`
 
 Home the gantry without rewriting the calibrated work-coordinate system —
 whichever `origin_policy` the gantry YAML selects (see [Gantry: Origin
 Policy](gantry.md#origin-policy)). No arguments.
+
+### `rinse`
+
+Dip a potentiostat probe into an uncapped vial three times, withdrawing to
+`safe_z` after each dip.
+
+- `instrument` *(str, required)* — mounted potentiostat name.
+- `vial` *(str, required)* — vial path, including holder or grid positions.
+- `measurement_height` *(float, required)* — negative offset in mm below the
+  calibrated vial rim; choose a depth that reaches the liquid and clears the bottom.
+
+```yaml
+protocol:
+  - rinse:
+      instrument: potentiostat
+      vial: vial_holder.vial_1
+      measurement_height: -5
+```
 
 ### `move`
 
@@ -155,8 +225,18 @@ approach and ends **above** the target (no descent).
   list, or a deck-target string.
 - `travel_z` *(float, default `null`)* — transit Z for literal/named XYZ moves:
   lift/lower to `travel_z` at the current XY, travel XY, then move to `position`.
-  Applies **only** to literal/named targets; supplying it with a deck target is
-  an error.
+  When omitted and the move changes XY, the gantry lifts to the working-volume
+  ceiling (`max(safe_z, z_max - instrument depth)`) before XY travel so every
+  mounted tool clears the deck; a Z-only move is sent as-is. Applies **only**
+  to literal/named targets; supplying it with a deck target is an error.
+- `x_offset_mm`, `y_offset_mm` *(float, default `0.0`)* — signed lateral
+  adjustments applied to the resolved destination.
+
+With `motion_planning` enabled on the deck, the collision-aware router owns
+the exact segments, including coordinated XY motion when clear. Offsets are
+applied before planning for literal, named, and deck targets; `travel_z` is
+rejected. Deck targets end at the carriage ceiling. Legacy decks retain
+axis-by-axis travel and the clearance behavior above.
 
 ### `measure`
 
@@ -175,6 +255,8 @@ instrument method, and persist the result if a campaign is attached.
   to the sensor-detected sample surface instead and must be at or below `0`.
 - `method_kwargs` *(dict, default `{}`)* — forwarded verbatim to the instrument
   method. See [method_kwargs](#method_kwargs) below.
+- `x_offset_mm`, `y_offset_mm` *(float, default `0.0`)* — signed lateral
+  adjustments applied to the resolved well.
 
 ### `scan`
 
@@ -193,6 +275,8 @@ instrument method at each well. Returns a `{well_id: result}` mapping.
   sample surface instead and must be at or below `0`.
 - `delay_s` *(float, default `0.0`)* — seconds to pause between wells.
 - `method_kwargs` *(dict, default `null`)* — forwarded to the method per well.
+- `x_offset_mm`, `y_offset_mm` *(float, default `0.0`)* — apply the same signed
+  lateral adjustment at every well in the scan.
 
 ### `pause`
 
@@ -213,12 +297,50 @@ All pipette commands require an instrument registered under the name `pipette`.
 The `height`/`source_height`/`destination_height` args follow the labware-relative
 height convention.
 
+`aspirate`, `dispense`, `blowout`, `mix`, and `transfer` accept
+`travel_clearance` (default `3.0` mm): a requested travel clearance above the
+registered plate top for consecutive operations on that same plate. Use a
+finite, non-negative number. During same-plate transitions between wells, the
+planner can travel at this local height; direct same-well transitions between
+action depths can move directly without first retracting to the local travel
+height. The planner may raise the requested height for scene or tool clearance,
+or use the full travel ceiling when needed. Set it to `null` to request full
+ceiling retraction. Decks without routing keep their existing routes. This
+setting does not change engage depths or the tip reuse policy.
+
+```yaml
+protocol:
+  - aspirate:
+      position: plate.A1
+      volume_ul: 20
+      travel_clearance: 5
+  - dispense:
+      position: plate.A1
+      volume_ul: 20
+      travel_clearance: null
+```
+
+**`speed` is a normalized 0–100 percentage** of the instrument's usable speed
+range, not a physical unit — each vendor driver maps it onto its own hardware
+scale, so a protocol stays portable. The `sartorius` driver maps the default
+`50.0` onto the pipette's own mid-scale setting. The `opentrons` driver
+currently ignores `speed` and lets its firmware choose a velocity; honoring it
+would change motion on machines already in service, so that remains a
+deliberate follow-up.
+
 #### `pick_up_tip`
 
 Pick up a tip from a tip-rack slot, record its length, and mark the slot consumed.
 
-- `position` *(str, required)* — tip-rack slot, including the explicit tip slot
-  (e.g. `tips.A1`).
+- `position` *(str, required)* — either an explicit tip slot (e.g. `tips.A1`)
+  or just the rack name (e.g. `tips`), which auto-selects the next available
+  tip in the rack's tip order as the rack is used up. Prefer the rack-only
+  form for protocols that don't need a specific slot; it lets a rack be
+  worked through within a run without manually advancing the slot. Tip
+  consumption only persists across separate runs when durable fluid tracking
+  is active (`context.fluid_state_id`); otherwise it's in-memory for that run
+  only, and a rerun starts from the first tip again — replace or refresh the
+  physical rack between runs in that case.
 - `speed` *(float, default `50.0`)* — approach/pick-up speed.
 
 #### `aspirate`
@@ -230,23 +352,81 @@ Move to a position and aspirate.
 - `speed` *(float, default `50.0`)* — aspirate speed.
 - `height` *(float, default `0.0`)* — engage offset.
 
+#### `dispense`
+
+Move to a position and dispense a specified volume from the attached tip.
+
+- `position` *(str, required)* — destination deck target.
+- `volume_ul` *(float, required)* — volume to dispense (µL).
+- `speed` *(float, default `50.0`)* — dispense speed.
+- `height` *(float, default `0.0`)* — labware-relative Z offset in mm.
+
+Standalone `aspirate`, `dispense`, and `blowout` support collision-aware routing,
+including attached-tip geometry, XY offsets, and the configured `height`. Timed `pause`
+keeps the current pose and does not add motion. All routes are checked before
+any step executes. These standalone liquid commands do not update durable
+fluid inventory and are rejected in routed runs when durable fluid tracking is active; use
+`transfer` for tracked liquid handling; it blows out after the final dispense.
+
 #### `blowout`
 
-Move to a position and blow out.
+Move to a position and blow out. By default, Sartorius Picus protocols then
+lift the tip vertically to `safe_z` before returning the piston home. This
+also applies to the final blowout in each `transfer` and `serial_transfer`
+destination, and at the last `multi_dispense` destination. `safe_z` must be above
+both the calibrated labware surface and the blowout height. A failed lift stops the command without homing; tracked
+transfer failures require reconciliation. Other pipette drivers retain their
+existing behavior. Setting `blowout_go_home: true` explicitly keeps the Picus
+return stroke at the blowout position, which can draw liquid into a submerged tip.
+
+For routed runs, the Picus withdrawal is checked during whole-protocol
+preflight and executed as an exact planned segment before piston homing.
+The following step starts from that withdrawn pose. Routed `transfer`, `mix`,
+and `drop_tip` also apply their XY offsets before collision checks. Routed
+`pick_up_tip` requires zero XY offsets to match the registered slot and its
+vertical access corridor.
+
+Routing v1 still rejects unsupported commands before any movement, including
+`image_well` sweeps and `pipette_home`. Those commands remain available on
+legacy decks; a planning-enabled deck never falls back to unplanned motion.
 
 - `position` *(str, required)* — deck target.
 - `speed` *(float, default `50.0`)* — blowout speed.
 - `height` *(float, default `0.0`)* — engage offset.
+- `x_offset_mm`, `y_offset_mm` *(float, default `0.0`)* — signed lateral
+  adjustments from the target.
+
+#### `pipette_home`
+
+Return the pipette piston to its home position without moving the gantry. Call
+this only after a separate `move` has lifted or moved the tip clear of liquid.
+No arguments.
 
 #### `mix`
 
-Move to a position and mix in place (repeated aspirate/dispense).
+Move to a position and mix between two heights. Each cycle aspirates at
+`height`, rises 1 mm to dispense and aspirate again, then returns to `height`
+to dispense. After the final cycle, the tip moves vertically to `blowout_height`
+over the same well and blows out once before the command completes.
 
 - `position` *(str, required)* — deck target.
 - `volume_ul` *(float, required)* — mix volume (µL).
-- `repetitions` *(int, default `3`)* — number of mix cycles.
+- `cycles` *(int, default `3`)* — number of mix cycles.
 - `speed` *(float, default `50.0`)* — mix speed.
 - `height` *(float, default `0.0`)* — engage offset.
+- `blowout_height` *(float, default `0.0`)* — finishing blowout offset from the
+  labware reference. Choose a height above the actual liquid surface; `0`
+  places the tip at the calibrated rim/reference, not at the submerged mixing
+  depth. The finish is included in bounds and collision checks.
+
+With fluid tracking, the mix is applied only after the finishing move and
+blowout succeed, including any required retraction and piston reset. Picus
+retracts vertically at the same XY offsets to `safe_z` before homing; the
+retraction is part of collision preflight. A failure leaves the operation
+requiring reconciliation.
+The finishing height is part of the operation identity: an older applied mix
+without that parameter cannot be replayed as if it had performed the new
+finish. Review existing operation records before resuming across this change.
 
 #### `transfer`
 
@@ -291,6 +471,11 @@ applied and a rerun never re-applies committed liquid.
   never runs `decap` itself; a target with no durable cap state at all is
   not constrained by this check.
 
+Every `transfer` runs the pipette's calibrated blow-out motion once, right
+after the final stroke's dispense, to clear any fluid left in the tip. Does
+not change the tracked dispense volume; a blow-out failure is treated the
+same as a dispense failure.
+
 #### `serial_transfer`
 
 Transfer from one source to each well along a plate row or column, with per-well
@@ -311,6 +496,83 @@ volumes given explicitly or interpolated.
 
 `volumes` and `volume_range` are **mutually exclusive** — provide exactly one.
 
+#### `multi_dispense`
+
+Aspirate the sum of the requested portions once, visit the destinations in
+list order, and dispense one portion at each. Blow out only after the last
+portion, at the last destination. `transfer` and `serial_transfer` retain their
+existing behavior; use this command to share a single aspiration.
+
+With the default Picus configuration, the final blowout is followed by a vertical
+retraction to `safe_z`, then piston homing. Clearance at the last destination is
+checked before aspiration. A retraction or homing failure stops without retry.
+
+- `source` *(str, required)* — source deck target.
+- `destinations` *(list of str, required)* — nonempty ordered deck targets.
+- `volumes` *(list of float, required)* — one positive, finite volume in µL
+  per destination. Each must meet the pipette model's minimum and maximum and
+  be a multiple of its volume increment, where specified. Picus
+  `whole_microlitres_only` configurations require whole-µL portions.
+- `speed` *(float, default `50.0`)* — normalized 0–100 pipette speed.
+- `source_height` *(float, default `0.0`)* — source labware-relative offset.
+- `destination_height` *(float, default `0.0`)* — labware-relative offset at
+  every destination.
+
+The total must fit the pipette capacity. Oversized batches are rejected before
+motion; split them into separate commands explicitly. A known empty pipette
+and attached tip are required. Both built-in drivers report loaded volume;
+external drivers must expose `config` and `loaded_volume_ul` to use this command.
+Liquid-class correction and automatic source selection are not applied.
+
+```yaml
+- multi_dispense:
+    source: plate.A1
+    destinations: [plate.B1, plate.C1, plate.D1]
+    volumes: [20.0, 30.0, 50.0]
+    source_height: -2.0
+    destination_height: 4.0
+```
+
+The same arguments work with `ProtocolBuilder.add_command("multi_dispense", ...)`.
+In the Operator protocol editor, each destination and its volume share a table
+row. Use **Add destination** or the row's remove button to change the batch;
+volumes are in µL. Empty destinations and nonpositive, nonfinite, or incomplete
+volumes block Save, Validate, and Run until corrected. **Validate** still checks
+the selected pipette's capacity, resolution, tip state, and motion bounds.
+Saved YAML retains the parallel `destinations` and `volumes` lists, and
+**Edit raw YAML** remains available.
+
+On decks with `motion_planning`, the complete batch is preflighted before any
+protocol movement: source access, every destination, and any final Picus
+retraction. Execution uses those exact collision-checked segments, with the
+same runtime pose and attached-tip checks as routed `transfer`. A blocked or
+out-of-bounds last destination rejects the whole protocol before pickup or
+aspiration. Direct calls on routed decks require the matching preflighted active
+step; changed arguments are rejected. Travel uses the carriage ceiling, without
+introducing a local-clearance override for this command.
+
+The [offline example](https://github.com/Ursa-Laboratories/CubOS/blob/main/packages/core/tests/fixtures/configs/pipette_tip_transfer/multi_dispense.yaml)
+uses the adjacent simulated gantry/deck fixtures; their geometry is not a
+physical calibration.
+
+**Tracking and failure behavior:** durable fluid tracking is unsupported because
+the journal cannot represent liquid held between destinations. Seeded validation
+and execution with a fluid-state session reject this command; use `transfer` or
+`serial_transfer` for those runs. Ordinary campaign logging records each
+successfully acknowledged portion. Without durable tracking, source availability
+and destination headroom remain the operator's responsibility. Any motion,
+aspiration, dispense, or blowout failure stops the batch without retry or
+recovery blowout. Earlier dispenses may have completed and liquid may remain in
+the tip. Driver volume is an estimate from acknowledged commands, not a sensor
+reading; after an uncertain failure, reconcile the physical tip and containers
+before starting another run. Do not replay the batch as a resume operation.
+
+Before merging a hardware-facing change, validate a calibrated setup offline,
+then supervise a fresh-tip 100 µL aspiration followed by 20/30/50 µL dispenses.
+Check destination order, absence of intermediate aspiration/blowout, final
+blowout and tip disposal, delivered volumes, and supervised interruption
+recovery. Automated tests use simulated pipettes and mocked motion only.
+
 #### `drop_tip`
 
 Move to a position and drop the tip.
@@ -328,13 +590,17 @@ Instruments](gantry-setup.md#define-instruments)). Both take:
   gantry.
 - `vial` *(str, required)* — deck target naming the vial (or vial-grid
   position) to decap/cap.
+- `x_offset_mm`, `y_offset_mm` *(float, default `0.0`)* — signed lateral
+  adjustments from the resolved vial position.
 
 Motion is fixed and built entirely from generic gantry primitives, never
 hardcoded per vial: **approach** at `safe_z` → **engage** at the
 instrument's configured `engage_depth_mm` (a labware-relative Z offset) →
-**capture**/**release** (sensor-confirmed, retried up to the instrument's
-`capture_retries`) → **retract** to `safe_z` → **park** at the
-instrument's configured `park_position`. A sensor timeout or a reading
+**capture**/**release** (with the configured decap Y shimmy, if any;
+sensor-confirmed and retried up to the instrument's
+`capture_retries`) → **retract** to `safe_z`. The tool is left above the
+vial; the next command lifts to the working-volume ceiling before any XY
+travel. A sensor timeout or a reading
 that contradicts the expected post-actuation state after all retries
 fails closed: the tool retracts to `safe_z` on a best-effort basis, the
 command raises, and — when durable fluid/cap tracking is active (see
@@ -353,13 +619,102 @@ must currently be tracked `capped`.
 Replace the cap on `vial`. When durable tracking is active, the vial must
 currently be tracked `uncapped`.
 
+### Lighting and imaging commands
+
+`set_lights` drives a lighting instrument (`type: lighting`); `capture` and
+`image_well` drive a camera instrument (`type: camera`). See [Gantry Setup:
+Define Instruments](gantry-setup.md#define-instruments). At the end of every
+run — completed or aborted — all lighting channels are commanded off
+best-effort, so a failed protocol never leaves lights on over a sample.
+
+#### `set_lights`
+
+Set one lighting channel, or turn everything off. Two mutually exclusive
+forms:
+
+- `instrument` *(str, required)* — lighting instrument registered on the
+  gantry.
+- `channel` *(str)* + `brightness` *(int)* — turn a channel on at that
+  percentage. The level must be one the vendor supports exactly (the
+  Pawduino lights expose `white`: 5/10/15/25/50/100 and `contact`
+  (red+blue): 5/10/20/30/50); `brightness: 0` turns just that channel off.
+- `all_off: true` — turn every channel off. (Named `all_off` because YAML
+  parses a bare `off:` key as a boolean.)
+
+No motion. Lights the protocol turns on stay on until a later step or the
+end-of-run fail-safe turns them off.
+
+#### `capture`
+
+Take one image wherever the gantry currently is and save it under the
+images directory (`~/.cubos/images`, override with `CUBOS_IMAGES_DIR`),
+grouped by campaign. No motion of its own — compose with `move` and
+`set_lights`.
+
+- `instrument` *(str, required)* — camera instrument registered on the
+  gantry.
+- `label` *(str, optional)* — filename label for the saved image.
+- `position` *(str, optional)* — deck target the image belongs to. Used
+  only to record the image against that labware/well in the data store
+  (`camera_measurements`); it does not move the camera. Without it the
+  file is still saved but not recorded.
+
+A capture failure fails the step. Offline camera vendors write a real
+placeholder PNG so dry runs exercise the full file/persistence path.
+
+#### `image_well`
+
+The packaged well-imaging sequence: approach through the multi-tool carriage
+clearance plane, descend to the imaging plane, light the well, capture, lights
+off, and retract to clearance. Lights-off and retraction are attempted even
+on failure. Setup validation checks the same capture positions and clearance
+plane as execution, including the segments between sweep positions.
+
+- `camera` *(str, required)* — camera instrument.
+- `well` *(str, required)* — deck target of the well to image.
+- `image_height` *(float, required)* — labware-relative offset in mm above
+  the well's surface Z: the camera's focus standoff. Like every height
+  argument it lives on the command, never on labware or instrument config.
+- `lights` *(str, optional)* — lighting instrument. Defaults to the
+  gantry's lighting instrument when it has exactly one; pass a name to
+  disambiguate, or the literal `none` to image with ambient light.
+- `label` *(str, optional)* — filename label (defaults to the well target).
+- `mode` *(str, default `standard`)* — `standard` is one shot with white
+  lights at 5% (or `brightness`); `curvature` is a contact-angle Z-stack:
+  from `image_height` descend `z_step_mm` per plane for `z_steps` planes
+  (defaults 0.2 mm × 11) with contact lights at 50% (or `brightness`),
+  labeling each image `{label}_z={absolute_z}mm_b{brightness}`. This preserves
+  the existing filename format: `absolute_z` is carriage WPos Z (well Z +
+  image height + camera depth), formatted to three decimal places with `-`
+  replacing the decimal point.
+- `brightness` *(int, optional)* — override the mode's default level.
+- `x_offset_mm`, `y_offset_mm` *(float, default `0`)* — shift a single
+  capture from the calibrated well center while preserving attribution to
+  that well.
+- `x_sweep_start_mm`, `x_sweep_stop_mm` *(float, optional pair)* — in
+  `standard` mode, capture an inclusive X sweep between these offsets. The
+  camera approaches the first point through clearance, then moves directly
+  between X positions at the image height and retracts after the last image.
+- `x_sweep_step_mm` *(float, default `1`)* — signed spacing between sweep
+  positions. Its sign must point from the start toward the stop. Sweep image
+  labels are prefixed with `left_*`, `center_*`, or `right_*`.
+
+Sweep validation rejects out-of-bounds positions and paths intersecting the
+configured gantry family's built-in fixed structures. Check actual labware
+and all mounted tools for clearance before a physical run; these checks do
+not model arbitrary objects placed on the deck.
+
+Capture and lighting failures **log and continue** (an image is never
+worth failing a run over) and the command returns the list of image paths
+actually saved. Motion failures still fail the run.
+
 ### Compound liquid commands
 
 `rinse_well`, `flush_pipette`, `purge_pipette`, and `clear_well` express
 reusable multi-step liquid-handling sequences by composing `transfer`/`mix`
 (they add no new preflight or journaling of their own — every safety guard,
 stroke split, and durable begin/complete step described under `transfer`
-above applies to each transfer they issue). `mix`'s existing `repetitions`
+above applies to each transfer they issue). `mix`'s existing `cycles`
 argument already covers "mix N times"; there is no separate compound mix
 command. Each also accepts `require_uncapped` (same contract as
 `transfer`'s — see [`transfer`](#transfer)), checked once up front before

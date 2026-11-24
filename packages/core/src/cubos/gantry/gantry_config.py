@@ -19,13 +19,15 @@ class GantryType(str, Enum):
 
     CUB = "cub"
     CUB_XL = "cub_xl"
+    GENMITSU_4040_PRO_MAX = "genmitsu_4040_pro_max"
 
 
 class OriginPolicy(str, Enum):
     """Which physical corner WPos zero is calibrated to.
 
     ``DECK_ORIGIN`` (default): WPos zero at the front-left-bottom deck
-    corner; the entire reachable working volume is non-negative.
+    corner. X/Y minima may be negative when the machine has usable travel
+    beyond that deck corner; Z remains non-negative.
     ``HOME_ORIGIN``: WPos zero at the homed back-right-top corner; the
     entire reachable working volume is non-positive (mirror-symmetric with
     ``DECK_ORIGIN``).
@@ -80,8 +82,10 @@ class GantryConfig:
     origin_policy: OriginPolicy = OriginPolicy.DECK_ORIGIN
     calibration_block_height_mm: Optional[float] = None
     safe_z: Optional[float] = None
+    default_feed_rate_mm_min: Optional[float] = None
     expected_grbl_settings: Optional[Dict[str, float]] = field(default=None)
     instruments: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    motion_envelopes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         try:
@@ -120,6 +124,10 @@ class GantryConfig:
                     "safe_z must be within the configured "
                     "working-volume Z bounds."
                 )
+        if self.default_feed_rate_mm_min is not None and self.default_feed_rate_mm_min <= 0:
+            raise ValueError(
+                f"default_feed_rate_mm_min ({self.default_feed_rate_mm_min}) must be > 0"
+            )
 
     @property
     def resolved_safe_z(self) -> float:

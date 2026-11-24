@@ -10,11 +10,16 @@ from cubos.gantry.errors import (
     CommandExecutionError,
     StatusReturnError,
 )
+from cubos.gantry.gantry_driver.exceptions import MillConnectionError
 from cubos.tools.calibration.single_instrument_calibration import (
     DeckOriginCalibrationResult,
     _calculate_block_z_calibration,
     _calibration_block_height_mm,
     _factory_z_travel_mm,
+    _read_hard_limits_enabled_if_available,
+    _restore_hard_limits_after_origin_jog,
+    _set_hard_limits_enabled_if_available,
+    _temporarily_enable_hard_limits_for_origin_jog,
     _updated_gantry_yaml_text,
     run_calibration,
 )
@@ -182,6 +187,10 @@ class _LimitRecoveringFakeGantry(_FakeGantry):
             raise CommandExecutionError("Alarm in status: <Alarm|WPos:0,0,0|Pn:Y>")
         super().jog(x=x, y=y, z=z, feed_rate=feed_rate)
 
+    def get_status(self) -> str:
+        self.calls.append(("get_status",))
+        return "<Idle|WPos:0,0,0>"
+
     def get_coordinates(self) -> dict[str, float]:
         if self.fail_next_recovery_readback:
             self.fail_next_recovery_readback = False
@@ -208,6 +217,20 @@ class _SoftLimitAwareFakeGantry(_FakeGantry):
     def set_soft_limits_enabled(self, enabled: bool) -> None:
         self.calls.append(("set_soft_limits_enabled", enabled))
         self.soft_limits_are_enabled = enabled
+
+
+class _BothLimitsAwareFakeGantry(_SoftLimitAwareFakeGantry):
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.hard_limits_are_enabled = False
+
+    def hard_limits_enabled(self) -> bool | None:
+        self.calls.append(("hard_limits_enabled",))
+        return self.hard_limits_are_enabled
+
+    def set_hard_limits_enabled(self, enabled: bool) -> None:
+        self.calls.append(("set_hard_limits_enabled", enabled))
+        self.hard_limits_are_enabled = enabled
 
 
 class _SoftLimitRejectingFakeGantry(_FakeGantry):
@@ -806,6 +829,117 @@ def test_run_calibration_temporarily_disables_stale_soft_limits(tmp_path):
     assert any("Restoring GRBL soft limits" in m for m in messages)
 
 
+def test_run_calibration_enables_hard_limits_for_origin_jog(tmp_path):
+    path = _write_gantry(tmp_path / "gantry.yaml")
+    messages: list[str] = []
+
+    result = run_calibration(
+        path,
+        output=messages.append,
+        gantry_factory=_BothLimitsAwareFakeGantry,
+        key_reader=_key_reader([("\r", 1)]),
+        stdin_flusher=lambda: None,
+    )
+
+    assert isinstance(result, DeckOriginCalibrationResult)
+    calls = _BothLimitsAwareFakeGantry.instance.calls
+    enable_call = ("set_hard_limits_enabled", True)
+    revert_call = ("set_hard_limits_enabled", False)
+    assert enable_call in calls
+    assert revert_call in calls
+    assert calls.index(enable_call) < calls.index(revert_call)
+    # Soft limits come back on before the hard-limit backstop is dropped.
+    assert calls.index(("set_soft_limits_enabled", True)) < calls.index(revert_call)
+    assert any("Enabling GRBL hard limits" in m for m in messages)
+    assert any("Restoring pre-calibration GRBL hard limits" in m for m in messages)
+
+
+def test_hard_limit_helpers_handle_missing_or_failing_capabilities():
+    messages: list[str] = []
+
+    class RaisingReader:
+        def hard_limits_enabled(self):
+            raise CommandExecutionError("read failed")
+
+    assert (
+        _read_hard_limits_enabled_if_available(RaisingReader(), output=messages.append)
+        is None
+    )
+    assert any("Could not read GRBL hard-limit state" in m for m in messages)
+
+    class ConnectionLostReader:
+        def hard_limits_enabled(self):
+            raise MillConnectionError("gone")
+
+    with pytest.raises(MillConnectionError):
+        _read_hard_limits_enabled_if_available(
+            ConnectionLostReader(), output=messages.append
+        )
+
+    # No setter available: nothing is written and nothing needs restoring.
+    assert _set_hard_limits_enabled_if_available(object(), True) is False
+
+    class ReaderWithoutSetter:
+        def hard_limits_enabled(self):
+            return False
+
+    assert (
+        _temporarily_enable_hard_limits_for_origin_jog(
+            ReaderWithoutSetter(), output=messages.append
+        )
+        is False
+    )
+    assert any("No GRBL setting writer" in m for m in messages)
+
+    _restore_hard_limits_after_origin_jog(object(), output=messages.append)
+    assert any("hard limits stay" in m for m in messages)
+
+
+def test_outer_finally_reverts_hard_limits_when_soft_restore_fails(tmp_path):
+    path = _write_gantry(tmp_path / "gantry.yaml")
+
+    class SoftRestoreFailsGantry(_BothLimitsAwareFakeGantry):
+        def set_soft_limits_enabled(self, enabled: bool) -> None:
+            super().set_soft_limits_enabled(enabled)
+            if enabled:
+                raise MillConnectionError("link died during soft-limit restore")
+
+    with pytest.raises(MillConnectionError):
+        run_calibration(
+            path,
+            output=lambda _message: None,
+            gantry_factory=SoftRestoreFailsGantry,
+            key_reader=_key_reader([("\r", 1)]),
+            stdin_flusher=lambda: None,
+        )
+
+    # The inner cleanup died before reaching the hard-limit revert; the
+    # outer safety net must still drop $21 back to its prior state.
+    calls = SoftRestoreFailsGantry.instance.calls
+    assert ("set_hard_limits_enabled", False) in calls
+
+
+def test_run_calibration_leaves_hard_limits_alone_when_already_on(tmp_path):
+    path = _write_gantry(tmp_path / "gantry.yaml")
+
+    class _HardLimitsOnFakeGantry(_BothLimitsAwareFakeGantry):
+        def __init__(self, config: dict):
+            super().__init__(config)
+            self.hard_limits_are_enabled = True
+
+    result = run_calibration(
+        path,
+        output=lambda _message: None,
+        gantry_factory=_HardLimitsOnFakeGantry,
+        key_reader=_key_reader([("\r", 1)]),
+        stdin_flusher=lambda: None,
+    )
+
+    assert isinstance(result, DeckOriginCalibrationResult)
+    calls = _HardLimitsOnFakeGantry.instance.calls
+    assert not any(call[0] == "set_hard_limits_enabled" for call in calls)
+
+
 def test_run_calibration_continues_after_error_15_jog_rejection(tmp_path):
     path = _write_gantry(tmp_path / "gantry.yaml")
     messages: list[str] = []
@@ -960,10 +1094,6 @@ def test_dry_run_prints_commands_without_connecting(tmp_path):
     assert "  $132=<z_span_mm>" in messages
     assert "  $22=1" in messages
     assert "  $20=1" in messages
-    assert (
-        "The gantry YAML cnc.factory_z_travel_mm is preserved as an out-of-box "
-        "safety bound; calibrated Z max comes from the homed readback."
-    ) in messages
 
 
 def test_dry_run_prints_ruler_gap_step(tmp_path):
@@ -997,11 +1127,10 @@ def test_dry_run_prints_bottom_reference_step(tmp_path):
     assert "  G10 L20 P1 Z0" in messages
 
 
-def test_rejects_legacy_negative_space_config(tmp_path):
-    path = _write_gantry(tmp_path / "legacy.yaml", x_min=-400.0)
+def test_accepts_negative_x_margin_beyond_deck_origin(tmp_path):
+    path = _write_gantry(tmp_path / "left-margin.yaml", x_min=-20.0)
 
-    with pytest.raises(ValueError, match="Deck-origin calibration requires"):
-        run_calibration(path, dry_run=True)
+    run_calibration(path, dry_run=True)
 
 
 # --- _factory_z_travel_mm unit tests ---

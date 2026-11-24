@@ -7,11 +7,11 @@ test.describe("deck import flow", () => {
     await page.goto("/");
 
     await page.getByRole("button", { name: "Deck", exact: true }).click();
-    await page.getByLabel("Import deck config").selectOption("asmi_deck.yaml");
+    await page.getByLabel("Deck config", { exact: true }).selectOption("asmi_deck.yaml");
 
     // The import writes a working copy instead of touching the source file.
     await expect
-      .poll(() => requestsTo(state, "PUT", "/deck/panda-deck.yaml").length)
+      .poll(() => requestsTo(state, "PUT", "/deck/cub_deck.yaml").length)
       .toBeGreaterThan(0);
     expect(requestsTo(state, "PUT", "/deck/asmi_deck.yaml")).toHaveLength(0);
 

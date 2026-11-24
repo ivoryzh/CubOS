@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from fastapi import APIRouter, HTTPException
 from cubos.gantry.session import (
     CalibrationBlockedError,
     GantryAlarmError,
+    GantryJogCancelledError,
     GantryNotConnectedError,
     GantryPositionSnapshot,
     GantrySession,
@@ -20,20 +22,23 @@ from cubos.gantry.session import (
     InterruptFeedHoldTimeoutError,
     MovementOutOfBoundsError,
 )
+from cubos.gantry.gantry_driver.exceptions import MillConnectionError
 from cubos.gantry.limit_recovery import looks_like_limit_alarm
 from cubos.gantry.yaml_schema import GantryYamlSchema
+from cubos.gantry.offset_calibration import calibrate_instrument_offsets
 from cubos.instruments.pipette.models import PIPETTE_MODELS
 from cubos.instruments.registry import (
     config_fields,
     list_measurement_methods,
+    list_measurement_method_params,
     get_supported_types,
     get_supported_vendors,
 )
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError, field_validator, model_validator
 
 from cubos_api.config import get_settings
 from cubos_api.models.gantry import GantryPosition, GantryResponse
-from cubos_api.services.yaml_io import list_configs, read_yaml, resolve_config_path, write_yaml
+from cubos_api.services.yaml_io import delete_config, list_configs, read_yaml, resolve_config_path, write_yaml
 
 router = APIRouter(prefix="/api/v1/gantry", tags=["gantry"])
 
@@ -76,7 +81,14 @@ class InstrumentFieldInfo(BaseModel):
     choices: Optional[List[Any]] = None
 
 
+class InstrumentOffsetsRequest(BaseModel):
+    config: Dict[str, Any]
+    reference_instrument: str
+    captures: Dict[str, Dict[str, Any]]
+
+
 class JogRequest(BaseModel):
+    jog_id: Optional[str] = Field(default=None, min_length=1, max_length=128, strict=True, pattern=r"\S")
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
@@ -120,18 +132,51 @@ class SetGrblSettingRequest(BaseModel):
 
 
 class JogBlockingRequest(BaseModel):
+    jog_id: Optional[str] = Field(default=None, min_length=1, max_length=128, strict=True, pattern=r"\S")
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
     timeout_s: float = 10.0
+    feed_rate: float = Field(default=2000.0, gt=0, le=2000, allow_inf_nan=False)
+
+    @field_validator("feed_rate", mode="before")
+    @classmethod
+    def _json_safe_feed_rate(cls, value):
+        # Non-finite numbers also break FastAPI's validation-error JSON.
+        return str(value) if isinstance(value, float) and not math.isfinite(value) else value
 
 
 class LimitRecoveryRequest(BaseModel):
+    jog_id: Optional[str] = Field(default=None, min_length=1, max_length=128, strict=True, pattern=r"\S")
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
     pull_off_mm: float = 5.0
-    feed_rate: float = 2500.0
+    feed_rate: float = 100.0
+
+
+class ManualLimitRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    axis: Literal["x", "y", "z"]
+    away_direction: StrictInt
+    operator_confirmed: StrictBool
+
+    @model_validator(mode="after")
+    def _direction_is_signed(self):
+        if self.away_direction not in (-1, 1):
+            raise ValueError("away_direction must be -1 or 1.")
+        return self
+
+
+class LimitRecoveryContextResponse(BaseModel):
+    failed_jog_id: Optional[str] = None
+    raw_status: str
+    active_limit_axes: List[Literal["x", "y", "z"]]
+    failed_jog_delta: Optional[Dict[str, float]]
+    eligible: bool
+    blocked_reason: Optional[str]
+    pull_off_delta: Optional[Dict[str, float]]
+    manual_available: bool
 
 
 class LimitRecoveryResponse(BaseModel):
@@ -139,6 +184,9 @@ class LimitRecoveryResponse(BaseModel):
     attempts: int
     pull_off: Dict[str, float]
     messages: List[str]
+    mode: Literal["known_jog", "manual"]
+    commanded_delta: Dict[str, float]
+    failed_delta: Optional[Dict[str, float]] = None
 
 
 class CalibrationCenterResponse(BaseModel):
@@ -152,6 +200,7 @@ class FinalizeOriginRequest(BaseModel):
     block_height: float
     factory_z_travel: float
     tolerance_mm: float = 0.25
+    origin_policy: Literal["deck_origin", "home_origin"] | None = None
 
 
 class FinalizeOriginResponse(BaseModel):
@@ -160,6 +209,9 @@ class FinalizeOriginResponse(BaseModel):
     max_travel: Dict[str, float]
     position: Dict[str, float]
     homing_pull_off_mm: Optional[float] = None
+    origin_policy: str = "deck_origin"
+    working_volume: Optional[Dict[str, float]] = None
+    safe_z: Optional[float] = None
 
 
 class ConnectRequest(BaseModel):
@@ -256,7 +308,7 @@ def _session_http_exception(exc: Exception, *, default_action: str) -> HTTPExcep
     if isinstance(exc, MovementOutOfBoundsError):
         status_code = 409 if _movement_requires_operator_reconnect(exc) else 400
         return HTTPException(status_code, str(exc))
-    if isinstance(exc, GantryAlarmError):
+    if isinstance(exc, (GantryAlarmError, GantryJogCancelledError)):
         return HTTPException(409, str(exc))
     if isinstance(exc, ValueError):
         return HTTPException(400, str(exc))
@@ -354,6 +406,15 @@ def get_instrument_methods() -> Dict[str, List[str]]:
     }
 
 
+@router.get("/instrument-method-params")
+def get_instrument_method_params() -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    """Per instrument type, each measurement method's method_kwargs schema."""
+    return {
+        type_key: list_measurement_method_params(type_key)
+        for type_key in get_supported_types()
+    }
+
+
 @router.get("/position")
 def get_position() -> GantryPosition:
     session = current_session()
@@ -376,7 +437,7 @@ def home() -> GantryPosition:
 def jog(req: JogRequest) -> dict:
     _reject_if_run_active()
     try:
-        _require_session().jog(x=req.x, y=req.y, z=req.z)
+        _require_session().jog(x=req.x, y=req.y, z=req.z, **({"jog_id": req.jog_id} if req.jog_id is not None else {}))
     except Exception as exc:
         logging.warning("Jog error: %s", exc)
         raise _session_http_exception(exc, default_action="Jog") from exc
@@ -417,6 +478,8 @@ def jog_blocking(req: JogBlockingRequest) -> GantryPosition:
                 y=req.y,
                 z=req.z,
                 timeout_s=req.timeout_s,
+                feed_rate=req.feed_rate,
+                **({"jog_id": req.jog_id} if req.jog_id is not None else {}),
             ),
             session=session,
         )
@@ -455,6 +518,17 @@ def configure_soft_limits(req: ConfigureSoftLimitsRequest) -> dict:
             exc, default_action="Soft-limit configuration"
         ) from exc
     return {"status": "ok"}
+
+
+@router.post("/calibration/instrument-offsets")
+def preview_instrument_offsets(req: InstrumentOffsetsRequest) -> Dict[str, Any]:
+    try:
+        GantryYamlSchema.model_validate(req.config)
+        result = calibrate_instrument_offsets(req.config, req.reference_instrument, req.captures)
+        GantryYamlSchema.model_validate(result)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/calibration/prepare-origin")
@@ -507,6 +581,7 @@ def finalize_calibration_origin(req: FinalizeOriginRequest) -> FinalizeOriginRes
             block_height=req.block_height,
             factory_z_travel=req.factory_z_travel,
             tolerance_mm=req.tolerance_mm,
+            **({"origin_policy": req.origin_policy} if req.origin_policy is not None else {}),
         )
     except Exception as exc:
         raise _session_http_exception(
@@ -518,42 +593,79 @@ def finalize_calibration_origin(req: FinalizeOriginRequest) -> FinalizeOriginRes
         "max_travel": result.max_travel,
         "position": result.position,
         "homing_pull_off_mm": result.homing_pull_off_mm,
+        "origin_policy": getattr(result, "origin_policy", "deck_origin"),
+        "working_volume": getattr(result, "working_volume", None),
+        "safe_z": getattr(result, "safe_z", None),
     }
     return FinalizeOriginResponse(**payload)
 
 
-@router.post("/calibration/recover-limit")
-def recover_calibration_limit(req: LimitRecoveryRequest) -> LimitRecoveryResponse:
-    try:
-        result, messages = _require_session().recover_calibration_limit(
-            x=req.x,
-            y=req.y,
-            z=req.z,
-            pull_off_mm=req.pull_off_mm,
-            feed_rate=req.feed_rate,
+def _limit_recovery_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, ValueError):
+        return _session_http_exception(exc, default_action="Limit recovery")
+    if isinstance(exc, MillConnectionError):
+        return HTTPException(
+            503,
+            "Controller connection lost during limit recovery. Power-cycle "
+            "the controller, re-seat the USB cable, then Disconnect and "
+            f"Connect again before continuing: {exc}",
         )
-    except ValueError as exc:
-        raise _session_http_exception(exc, default_action="Limit recovery") from exc
-    except GantryAlarmError as exc:
-        raise HTTPException(
+    if isinstance(exc, GantryAlarmError) or looks_like_limit_alarm(exc):
+        return HTTPException(
             409,
             "Limit recovery did not clear the gantry alarm. "
             f"Use E-stop/controller reset before continuing: {exc}",
-        ) from exc
-    except Exception as exc:
-        if looks_like_limit_alarm(exc):
-            raise HTTPException(
-                409,
-                "Limit recovery did not clear the gantry alarm. "
-                f"Use E-stop/controller reset before continuing: {exc}",
-            ) from exc
-        raise _session_http_exception(exc, default_action="Limit recovery") from exc
+        )
+    return _session_http_exception(exc, default_action="Limit recovery")
+
+
+def _limit_recovery_response(result, messages) -> LimitRecoveryResponse:
     return LimitRecoveryResponse(
         status="recovered",
         attempts=result.attempts,
         pull_off=result.pull_off_delta,
         messages=messages,
+        mode=getattr(result, "mode", "known_jog"),
+        commanded_delta=getattr(result, "commanded_delta", None) or result.pull_off_delta,
+        failed_delta=getattr(result, "failed_delta", None),
     )
+
+
+@router.get("/calibration/recovery-context")
+def limit_recovery_context() -> LimitRecoveryContextResponse:
+    _reject_if_run_active()
+    try:
+        context = _require_session().limit_recovery_context()
+    except Exception as exc:
+        raise _limit_recovery_exception(exc) from exc
+    return LimitRecoveryContextResponse(**asdict(context))
+
+
+@router.post("/calibration/recover-limit")
+def recover_calibration_limit(req: LimitRecoveryRequest) -> LimitRecoveryResponse:
+    _reject_if_run_active()
+    try:
+        result, messages = _require_session().recover_calibration_limit(
+            x=req.x, y=req.y, z=req.z,
+            pull_off_mm=req.pull_off_mm, feed_rate=req.feed_rate,
+            **({"jog_id": req.jog_id} if req.jog_id is not None else {}),
+        )
+    except Exception as exc:
+        raise _limit_recovery_exception(exc) from exc
+    return _limit_recovery_response(result, messages)
+
+
+@router.post("/calibration/recover-limit/manual")
+def recover_calibration_limit_manual(req: ManualLimitRecoveryRequest) -> LimitRecoveryResponse:
+    _reject_if_run_active()
+    try:
+        result, messages = _require_session().recover_calibration_limit_manual(
+            axis=req.axis, away_direction=req.away_direction,
+            operator_confirmed=req.operator_confirmed,
+        )
+    except Exception as exc:
+        raise _limit_recovery_exception(exc) from exc
+    return _limit_recovery_response(result, messages)
 
 
 @router.post("/unlock")
@@ -596,7 +708,12 @@ def feed_hold() -> GantryPosition:
 def jog_cancel() -> GantryPosition:
     session = _require_session()
     try:
-        return _position_response(session.jog_cancel(), session=session)
+        # Realtime cancel (0x85) without waiting on the operation lock:
+        # during a held jog the lock is contended by queued jog requests,
+        # and a cancel that waits its turn arrives after the motion it was
+        # meant to stop. position() is non-blocking (cache fallback).
+        session.jog_cancel_interrupt()
+        return _position_response(session.position(), session=session)
     except Exception as exc:
         raise _session_http_exception(exc, default_action="Jog cancel") from exc
 
@@ -624,11 +741,18 @@ def connect(body: Optional[ConnectRequest] = None) -> GantryPosition:
     session = _get_or_create_session()
     if session.connected:
         raise HTTPException(409, "Gantry already connected; disconnect first")
+    # Manually connected instruments belong to the previous config; the
+    # import is deferred to avoid a circular import at module load.
+    from cubos_api.routers.instruments import reset_manual_instruments
+
+    reset_manual_instruments()
     try:
         filename, path = _selected_gantry_path(body.filename if body else None)
         snapshot = session.connect(path, filename=filename)
     except HTTPException:
         raise
+    except CalibrationBlockedError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except (ValueError, ValidationError, yaml.YAMLError) as exc:
         raise HTTPException(400, f"Invalid gantry config: {exc}") from exc
     except Exception as exc:
@@ -638,6 +762,9 @@ def connect(body: Optional[ConnectRequest] = None) -> GantryPosition:
 
 @router.post("/disconnect")
 def disconnect() -> GantryPosition:
+    from cubos_api.routers.instruments import reset_manual_instruments
+
+    reset_manual_instruments()
     session = current_session()
     if session is None:
         return GantryPosition(connected=False, status="Disconnected")
@@ -676,6 +803,22 @@ def put_gantry(filename: str, body: dict) -> GantryResponse:
     if session is not None:
         session.refresh_connected_config(filename, config_dict)
     return get_gantry(filename)
+
+
+@router.delete("/{filename}")
+def delete_gantry(filename: str) -> dict:
+    if run_active():
+        raise HTTPException(409, "Cannot delete a gantry config while a protocol run is active")
+    session = current_session()
+    if session is not None and session.connected_gantry_filename == filename:
+        raise HTTPException(409, f"{filename} is the connected gantry config; disconnect before deleting it")
+    try:
+        delete_config(get_settings().configs_dir, "gantry", filename)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError:
+        raise HTTPException(404, f"Config not found: {filename}")
+    return {"status": "deleted", "filename": filename}
 
 
 def request_feed_hold_interrupt() -> None:

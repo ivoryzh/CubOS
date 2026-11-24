@@ -14,14 +14,15 @@ const deck: DeckResponse = {
         model_name: "panda_2x2_tip_rack",
         rows: 2,
         columns: 2,
-        z_pickup: 30,
-        z_drop: 24,
-        tips: {
-          A1: { x: 10, y: 20, z: 30 },
-          A2: { x: 19, y: 20, z: 30 },
-          B1: { x: 10, y: 11, z: 30 },
-          B2: { x: 19, y: 11, z: 30 },
+        pickup_z: 30,
+        drop_z: 24,
+        tip_length: 59.3,
+        calibration: {
+          a1: { x: 10, y: 20 },
+          a2: { x: 19, y: 20 },
         },
+        x_offset: 9,
+        y_offset: 9,
       },
       wells: null,
       location: { x: 10, y: 20, z: 30 },
@@ -61,6 +62,24 @@ const deck: DeckResponse = {
         "plate.A2": { x: 109, y: 120, z: 45 },
         "plate.B1": { x: 100, y: 111, z: 45 },
         "plate.B2": { x: 109, y: 111, z: 45 },
+      },
+    },
+    {
+      key: "tip_disposal",
+      config: {
+        type: "tip_disposal",
+        name: "Panda Trash",
+        model_name: "panda_black_tip_disposal",
+        location: { x: 250, y: 118, z: 38 },
+        length: 58,
+        width: 150,
+        height: 38,
+      },
+      wells: null,
+      location: { x: 250, y: 118, z: 38 },
+      geometry: { length: 58, width: 150, height: 38 },
+      positions: {
+        discard: { x: 250, y: 118, z: 38 },
       },
     },
     {
@@ -104,10 +123,43 @@ describe("DeckVisualization", () => {
     );
 
     expect(screen.getByText("Rack A")).toBeInTheDocument();
+    expect(screen.getByText("Panda Trash")).toBeInTheDocument();
     expect(screen.getByText("Plate Holder")).toBeInTheDocument();
     expect(screen.getByText("Panda Plate")).toBeInTheDocument();
     expect(screen.getByText("Panda Vials")).toBeInTheDocument();
     expect(screen.getByText("Sample 1")).toBeInTheDocument();
+  });
+
+  it("renders an unsaved tip disposal from its config alone", () => {
+    render(
+      <DeckVisualization
+        deck={{
+          filename: "unsaved",
+          labware: [
+            {
+              key: "tipdisposal_1",
+              config: {
+                type: "tip_disposal",
+                name: "New Trash",
+                model_name: "tip_disposal",
+                location: { x: 200, y: 100, z: 38 },
+                length: 58,
+                width: 150,
+                height: 38,
+              },
+              wells: null,
+            },
+          ],
+        }}
+        instruments={null}
+        gantryPosition={null}
+        machineXRange={[0, 300]}
+        machineYRange={[0, 200]}
+      />,
+    );
+
+    expect(screen.getByText("New Trash")).toBeInTheDocument();
+    expect(screen.getByTestId("deck-visualization").outerHTML).not.toContain("NaN");
   });
 
   it("letterboxes unequal machine ranges and scales well radii from mm", () => {
@@ -230,42 +282,75 @@ describe("DeckVisualization", () => {
     expect(screen.getByText("350")).toBeInTheDocument();
   });
 
-  // Regression: bed mode used to translate the deck by -gantryY, moving it
-  // up-screen. The head marker is pinned at deck-frame Y=0 (bottom of the
-  // frame), so when WPos.y=50 the deck must shift down-screen (+sy) to put
-  // deck point y=50 under the fixed marker — the sign was inverted.
-  it("shifts the deck down-screen as gantry Y increases in bed mode", () => {
-    const { container } = render(
-      <DeckVisualization
-        deck={{ filename: "empty.yaml", labware: [] }}
-        instruments={null}
-        gantryPosition={{
-          connected: true,
-          status: "Idle",
-          x: 0,
-          y: 50,
-          z: 0,
-          work_x: 0,
-          work_y: 50,
-          work_z: 0,
-          calibration_active: false,
-        }}
-        machineXRange={[0, 300]}
-        machineYRange={[0, 200]}
-        yAxisMotion="bed"
-      />,
-    );
+  it("plots actual Y=145 without shifting calibrated labware when gantry Y changes", () => {
+    const instruments = {pipette:{type:"pipette",vendor:"sartorius",offset_x:0,offset_y:0}};
+    const pos = (y: number) => ({connected:true,status:"Idle",x:100,y,z:0,work_x:100,work_y:y,work_z:0,calibration_active:false});
+    const {container,rerender} = render(<DeckVisualization deck={deck} instruments={instruments}
+      gantryPosition={pos(0)} machineXRange={[0,258]} machineYRange={[0,145]} yAxisMotion="bed" />);
+    const labwareGroup = screen.getByText("Rack A").closest("svg")!.querySelectorAll(":scope > g")[1];
+    const initialLabware = labwareGroup.outerHTML;
+    const headY0 = Number(screen.getByText("HEAD").parentElement!.querySelector("circle")!.getAttribute("cy"));
+    rerender(<DeckVisualization deck={deck} instruments={instruments}
+      gantryPosition={pos(145)} machineXRange={[0,258]} machineYRange={[0,145]} yAxisMotion="bed" />);
+    expect(labwareGroup.outerHTML).toBe(initialLabware);
+    expect(container.querySelector("g[transform]")).toBeNull();
+    expect(screen.queryByText("bed moves Y")).not.toBeInTheDocument();
+    const headY145 = Number(screen.getByText("HEAD").parentElement!.querySelector("circle")!.getAttribute("cy"));
+    const ticks = Array.from(container.querySelectorAll("text[text-anchor='end']"));
+    const first = ticks[0];
+    const second = ticks.find(node => Number(node.textContent) !== Number(first.textContent))!;
+    const scale = Math.abs((Number(second.getAttribute("y"))-Number(first.getAttribute("y"))) /
+      (Number(second.textContent)-Number(first.textContent)));
+    expect(headY145-headY0).toBeCloseTo(-145*scale,8);
+    const pipette = screen.getByText("pipette").parentElement!.querySelector("rect")!;
+    expect(Number(pipette.getAttribute("y"))+7).toBeCloseTo(headY145,8);
+    expect(screen.getByText("pipette").parentElement!.querySelector("title")!.textContent).toContain("(100.0, 145.0)");
+  });
 
-    expect(screen.getByText("bed moves Y")).toBeInTheDocument();
-    const deckGroup = container.querySelector("g[transform]");
-    expect(deckGroup).not.toBeNull();
-    const match = /translate\(0,\s*(-?[\d.]+)\)/.exec(deckGroup!.getAttribute("transform")!);
-    expect(match).not.toBeNull();
-    const translateY = Number(match![1]);
-    // Visual bounds pad [0,300]x[0,200] to [-10,310]x[-10,210]; the 420px-high
-    // SVG letterboxes to scale = (420 - 40) / 220 px/mm.
-    const expectedScale = (420 - 2 * 20) / 220;
-    expect(translateY).toBeCloseTo(50 * expectedScale, 3);
+  it.each([
+    ["bed", 0, [0, 258], [0, 145]],
+    ["bed", 72.5, [0, 258], [0, 145]],
+    ["bed", 145, [0, 258], [0, 145]],
+    ["bed", -145, [-258, 0], [-145, 0]],
+    ["bed", -72.5, [-258, 0], [-145, 0]],
+    ["bed", 0, [-258, 0], [-145, 0]],
+    ["head", 145, [0, 258], [0, 145]],
+    ["head", -72.5, [-258, 0], [-145, 0]],
+  ] as const)("keeps zero-offset pipette on HEAD in %s mode at Y=%s", (mode, y, xRange, yRange) => {
+    const x = xRange[0] < 0 ? -100 : 100;
+    const { container } = render(<DeckVisualization
+      deck={{filename:"empty.yaml",labware:[]}}
+      instruments={{
+        pipette:{type:"pipette",vendor:"sartorius",offset_x:0,offset_y:0},
+        camera:{type:"camera",vendor:"usb",offset_x:2.5,offset_y:-28.75},
+      }}
+      gantryPosition={{connected:true,status:"Idle",x,y,z:0,work_x:x,work_y:y,work_z:0,calibration_active:false}}
+      machineXRange={[...xRange]} machineYRange={[...yRange]} yAxisMotion={mode}
+    />);
+    const head = screen.getByText("HEAD").parentElement!.querySelector("circle")!;
+    const pipetteGroup = screen.getByText("pipette").parentElement!;
+    const cameraGroup = screen.getByText("camera").parentElement!;
+    const pipette = pipetteGroup.querySelector("rect")!;
+    const camera = cameraGroup.querySelector("rect")!;
+    const center = (rect: SVGRectElement) => ({x:Number(rect.getAttribute("x"))+7,y:Number(rect.getAttribute("y"))+7});
+    const pipetteCenter = center(pipette);
+    const cameraCenter = center(camera);
+    expect(pipetteCenter.x).toBeCloseTo(Number(head.getAttribute("cx")),8);
+    expect(pipetteCenter.y).toBeCloseTo(Number(head.getAttribute("cy")),8);
+    expect(container.querySelector("g[transform]")).toBeNull();
+    const gridTicks = Array.from(container.querySelectorAll("text[text-anchor='end']"));
+    const y0 = gridTicks[0];
+    const otherTick = gridTicks.find(node => Number(node.textContent) !== Number(y0.textContent))!;
+    const scale = Math.abs((Number(otherTick.getAttribute("y"))-Number(y0.getAttribute("y"))) /
+      (Number(otherTick.textContent)-Number(y0.textContent)));
+    // Grid labels sit 3 pixels below their coordinate lines.
+    const expectedHeadY = Number(y0.getAttribute("y"))-3-(y-Number(y0.textContent))*scale;
+    expect(Number(head.getAttribute("cy"))).toBeCloseTo(expectedHeadY,8);
+    expect(cameraCenter.x-pipetteCenter.x).toBeCloseTo(2.5*scale,8);
+    expect(cameraCenter.y-pipetteCenter.y).toBeCloseTo(28.75*scale,8);
+    expect(cameraGroup.querySelector("title")!.textContent).toBe(`camera (camera) at (${(x+2.5).toFixed(1)}, ${(y-28.75).toFixed(1)})`);
+    expect(pipetteGroup.querySelector("title")!.textContent).toBe(`pipette (pipette) at (${x.toFixed(1)}, ${y.toFixed(1)})`);
+    expect(Number(pipetteGroup.querySelector("text")!.getAttribute("y"))).toBeCloseTo(Math.max(12,pipetteCenter.y-10),8);
   });
 
   it("renders holder labware with current CubOS dimension keys without NaN attributes", () => {

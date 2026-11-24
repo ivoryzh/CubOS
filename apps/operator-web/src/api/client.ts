@@ -1,10 +1,44 @@
 const BASE = "/api/v1";
 
+export type RecoveryAxis = "x" | "y" | "z";
+export type RecoveryDelta = { x: number; y: number; z: number };
+export type LimitRecoveryContext = {
+  raw_status: string;
+  active_limit_axes: RecoveryAxis[];
+  failed_jog_delta: RecoveryDelta | null;
+  failed_jog_id?: string | null;
+  eligible: boolean;
+  blocked_reason: string | null;
+  pull_off_delta: RecoveryDelta | null;
+  manual_available: boolean;
+};
+export type LimitRecoveryResult = {
+  status: string;
+  attempts: number;
+  pull_off: RecoveryDelta;
+  messages: string[];
+  mode: "known_jog" | "manual";
+  commanded_delta: RecoveryDelta;
+  failed_delta: RecoveryDelta | null;
+};
+
 export type SettingsResponse = {
   config_dir: string;
 };
 
-class ApiError extends Error {
+export type UpdateStatus = {
+  current_sha: string;
+  latest_sha: string;
+  commits_behind: number;
+  update_available: boolean;
+  checked_at: number;
+  summary: string[];
+  error: string | null;
+  current_tag: string | null;
+  latest_tag: string | null;
+};
+
+export class ApiError extends Error {
   status: number;
 
   constructor(status: number, message: string) {
@@ -41,6 +75,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
+let homingEpoch = 0;
+
+async function homingRequest<T>(path: string): Promise<T> {
+  homingEpoch += 1;
+  try {
+    return await request<T>(path, { method: "POST" });
+  } finally {
+    homingEpoch += 1;
+  }
+}
+
+async function readGantryPosition(): Promise<import("../types").GantryPosition> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const epoch = homingEpoch;
+    const result = await request<import("../types").GantryPosition>("/gantry/position");
+    if (epoch === homingEpoch) return result;
+  }
+  throw new Error("Position changed during homing. Wait for a fresh position update.");
+}
+
 async function download(path: string): Promise<Blob> {
   const res = await fetch(`${BASE}${path}`);
   if (!res.ok) {
@@ -60,7 +114,9 @@ export const deckApi = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
-  previewWells: (config: import("../types").WellPlateConfig) =>
+  delete: (filename: string) =>
+    request<{ status: string; filename: string }>(`/deck/${filename}`, { method: "DELETE" }),
+  previewWells: (config: import("../types").WellPlateConfig | import("../types").TipRackConfig) =>
     request<Record<string, import("../types").WellPosition>>("/deck/preview-wells", {
       method: "POST",
       body: JSON.stringify(config),
@@ -78,6 +134,8 @@ export const gantryApi = {
     request<import("../types").InstrumentSchemas>("/gantry/instrument-schemas"),
   getInstrumentMethods: () =>
     request<import("../types").InstrumentMeasurementMethods>("/gantry/instrument-methods"),
+  getInstrumentMethodParams: () =>
+    request<import("../types").InstrumentMethodParams>("/gantry/instrument-method-params"),
   get: (filename: string) =>
     request<import("../types").GantryResponse>(`/gantry/${filename}`),
   put: (filename: string, body: import("../types").GantryConfig) =>
@@ -85,8 +143,9 @@ export const gantryApi = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
-  getPosition: () =>
-    request<import("../types").GantryPosition>("/gantry/position"),
+  delete: (filename: string) =>
+    request<{ status: string; filename: string }>(`/gantry/${filename}`, { method: "DELETE" }),
+  getPosition: readGantryPosition,
   connect: (filename: string) =>
     request<import("../types").GantryPosition>("/gantry/connect", {
       method: "POST",
@@ -96,15 +155,13 @@ export const gantryApi = {
     request<import("../types").GantryPosition>("/gantry/disconnect", {
       method: "POST",
     }),
-  jog: (x = 0, y = 0, z = 0) =>
+  jog: (x = 0, y = 0, z = 0, jog_id?: string) =>
     request<{ status: string }>("/gantry/jog", {
       method: "POST",
-      body: JSON.stringify({ x, y, z }),
+      body: JSON.stringify({ x, y, z, jog_id }),
     }),
   home: () =>
-    request<import("../types").GantryPosition>("/gantry/home", {
-      method: "POST",
-    }),
+    homingRequest<import("../types").GantryPosition>("/gantry/home"),
   moveTo: (x: number, y: number, z: number) =>
     request<{ status: string }>("/gantry/move-to", {
       method: "POST",
@@ -115,32 +172,37 @@ export const gantryApi = {
       method: "POST",
       body: JSON.stringify({ x, y, z }),
     }),
-  jogBlocking: (x = 0, y = 0, z = 0, timeout_s = 10) =>
+  jogBlocking: (x = 0, y = 0, z = 0, timeout_s = 10, jog_id?: string) =>
     request<import("../types").GantryPosition>("/gantry/jog-blocking", {
       method: "POST",
-      body: JSON.stringify({ x, y, z, timeout_s }),
+      body: JSON.stringify({ x, y, z, timeout_s, jog_id }),
     }),
   setWorkCoordinates: (body: { x?: number; y?: number; z?: number }) =>
     request<import("../types").GantryPosition>("/gantry/work-coordinates", {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  previewInstrumentOffsets: (body: {
+    config: import("../types").GantryConfig;
+    reference_instrument: string;
+    captures: Record<string, { x: number; y: number; z: number; tip_length_mm: number; stand_off_mm?: number }>;
+  }) => request<import("../types").GantryConfig>("/gantry/calibration/instrument-offsets", {
+    method: "POST",
+    body: JSON.stringify(body),
+  }),
   prepareCalibrationOrigin: () =>
-    request<import("../types").GantryPosition>("/gantry/calibration/prepare-origin", {
-      method: "POST",
-    }),
+    homingRequest<import("../types").GantryPosition>("/gantry/calibration/prepare-origin"),
   homeAndCenterForCalibration: () =>
-    request<{
+    homingRequest<{
       xy_bounds: { x: number; y: number; z: number };
       position: { x: number; y: number; z: number };
-    }>("/gantry/calibration/home-and-center", {
-      method: "POST",
-    }),
+    }>("/gantry/calibration/home-and-center"),
   restoreCalibrationSoftLimits: () =>
     request<import("../types").GantryPosition>("/gantry/calibration/restore-soft-limits", {
       method: "POST",
     }),
   finalizeCalibrationOrigin: (body: {
+    origin_policy?: "deck_origin" | "home_origin";
     home_z: number;
     block_touch_z: number;
     block_height: number;
@@ -151,21 +213,22 @@ export const gantryApi = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  getLimitRecoveryContext: () => request<LimitRecoveryContext>("/gantry/calibration/recovery-context"),
   recoverCalibrationLimit: (body: {
     x: number;
     y: number;
     z: number;
     pull_off_mm?: number;
     feed_rate?: number;
+    jog_id?: string;
   }) =>
-    request<{
-      status: string;
-      attempts: number;
-      pull_off: { x: number; y: number; z: number };
-      messages: string[];
-    }>("/gantry/calibration/recover-limit", {
+    request<LimitRecoveryResult>("/gantry/calibration/recover-limit", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  recoverCalibrationLimitManual: (body: { axis: RecoveryAxis; away_direction: -1 | 1; operator_confirmed: true }) =>
+    request<LimitRecoveryResult>("/gantry/calibration/recover-limit/manual", {
+      method: "POST", body: JSON.stringify(body),
     }),
   configureSoftLimits: (body: {
     max_travel_x: number;
@@ -220,6 +283,8 @@ export const protocolApi = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+  delete: (filename: string) =>
+    request<{ status: string; filename: string }>(`/protocol/${filename}`, { method: "DELETE" }),
   validate: (body: import("../types").ProtocolConfig) =>
     request<import("../types").ProtocolValidationResponse>(
       "/protocol/validate",
@@ -264,6 +329,12 @@ export const runsApi = {
       body: JSON.stringify(body),
     }),
   get: (runId: string) => request<import("../types").RunRecord>(`/runs/${runId}`),
+  plan: (runId: string) =>
+    request<import("../types").RunPlanResponse>(`/runs/${runId}/plan`),
+  events: (runId: string, after = 0) =>
+    request<import("../types").RunEventsResponse>(
+      `/runs/${runId}/events?after=${after}`,
+    ),
   cancel: (runId: string) =>
     request<import("../types").RunRecord>(`/runs/${runId}/cancel`, {
       method: "POST",
@@ -318,12 +389,34 @@ export const settingsApi = {
     }),
 };
 
+export const systemApi = {
+  getUpdateStatus: (refresh = false) =>
+    request<UpdateStatus>(`/system/update${refresh ? "?refresh=true" : ""}`),
+  applyUpdate: () =>
+    request<{ status: string; target_sha: string }>("/system/update/apply", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  health: () => request<{ status: string }>("/health"),
+};
+
 // Result data
 export const dataApi = {
   listCampaigns: () =>
     request<import("../types").CampaignSummary[]>("/data/campaigns"),
-  exportCampaignMeasurementsZip: (campaignId: number) =>
-    download(`/data/campaigns/${campaignId}/measurements.zip`),
-  exportCampaignAsmiZip: (campaignId: number) =>
-    download(`/data/campaigns/${campaignId}/asmi.zip`),
+  downloadCampaignData: (campaignId: number) =>
+    download(`/data/campaigns/${campaignId}/data.zip`),
 };
+
+// Manual instrument control (bring-up work, outside protocol runs)
+export const instrumentsApi = {
+  captureCameraFrame: (instrument: string, preview = false) =>
+    request<{ instrument: string; image_path: string }>("/instruments/camera/capture", {
+      method: "POST",
+      body: JSON.stringify({ instrument, preview }),
+    }),
+  cameraLastImage: (instrument: string) =>
+    // Cache-bust: repeated preview polls hit the same URL as the frame changes.
+    download(`/instruments/camera/last-image?instrument=${encodeURIComponent(instrument)}&_=${Date.now()}`),
+};
+

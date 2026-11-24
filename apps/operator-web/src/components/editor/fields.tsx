@@ -93,6 +93,66 @@ export function NumberField({ id, name, label, value, onChange, required, disabl
   );
 }
 
+interface OptionalNumberFieldProps {
+  id?: string;
+  name?: string;
+  label: string;
+  /** `null`/`undefined` means unset — distinct from `NumberField`, which
+   * always has a concrete numeric value. */
+  value: number | null | undefined;
+  /** Called with `null` when the field is cleared, so the caller can omit
+   * the argument entirely instead of saving an empty string or a stale
+   * number. */
+  onChange: (v: number | null) => void;
+  disabled?: boolean;
+  /** If set, renders an amber "*" next to the label when true. */
+  dirty?: boolean;
+}
+
+/** Like `NumberField`, but for optional numeric args: clearing the input
+ * reports `null` (omit the argument) instead of being blocked or silently
+ * reverting to the last valid number. */
+export function OptionalNumberField({ id, name, label, value, onChange, disabled, dirty }: OptionalNumberFieldProps) {
+  const normalizedValue = typeof value === "number" && Number.isFinite(value) ? value : null;
+  const [state, setState] = useState({
+    raw: normalizedValue === null ? "" : formatNumberInput(normalizedValue),
+    value: normalizedValue,
+  });
+  if (!Object.is(normalizedValue, state.value)) {
+    setState({ raw: normalizedValue === null ? "" : formatNumberInput(normalizedValue), value: normalizedValue });
+  }
+  const raw = state.raw;
+  const setRaw = (next: string) => setState({ raw: next, value: normalizedValue });
+
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+      <span style={theme.fieldLabel}>
+        {label}
+        {dirty && <DirtyMarker />}
+      </span>
+      <input
+        id={id}
+        name={name}
+        type="text"
+        inputMode="decimal"
+        value={raw}
+        disabled={disabled}
+        onChange={(e) => {
+          setRaw(e.target.value);
+          if (e.target.value.trim() === "") {
+            onChange(null);
+            return;
+          }
+          const n = tryParse(e.target.value);
+          if (n !== null) onChange(n);
+        }}
+        onBlur={() => setRaw(normalizedValue === null ? "" : formatNumberInput(normalizedValue))}
+        style={inputStyle}
+      />
+    </label>
+  );
+}
+
 
 interface TextFieldProps {
   id?: string;
@@ -210,6 +270,68 @@ export function CoordinateField({ id, name, label, value, onChange, required }: 
   );
 }
 
+interface Coordinate2DFieldProps {
+  id?: string;
+  name?: string;
+  label: string;
+  value: { x: number; y: number };
+  onChange: (v: { x: number; y: number }) => void;
+  required?: boolean;
+}
+
+/** XY-only variant of CoordinateField for calibration points whose Z is
+ * defined elsewhere (e.g. a tip rack's pickup_z). */
+export function Coordinate2DField({ id, name, label, value, onChange, required }: Coordinate2DFieldProps) {
+  const [state, setState] = useState({
+    rx: String(value.x),
+    ry: String(value.y),
+    x: value.x,
+    y: value.y,
+  });
+  if (value.x !== state.x || value.y !== state.y) {
+    setState({ rx: String(value.x), ry: String(value.y), x: value.x, y: value.y });
+  }
+  const { rx, ry } = state;
+  const setRx = (next: string) => setState({ ...state, rx: next });
+  const setRy = (next: string) => setState({ ...state, ry: next });
+
+  return (
+    <div style={{ fontSize: 12 }}>
+      <span style={theme.fieldLabel}>{label}{required && <span style={{ color: theme.color.danger }}> *</span>}</span>
+      <div style={{ ...coordinateGridStyle, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
+        <label style={axisFieldStyle}>
+          <span style={axisLabelStyle}>X</span>
+          <input
+            id={id ? `${id}-x` : undefined}
+            name={name ? `${name}_x` : undefined}
+            aria-label={`${label} X`}
+            type="text"
+            inputMode="decimal"
+            value={rx}
+            onChange={(e) => { setRx(e.target.value); const n = tryParse(e.target.value); if (n !== null) onChange({ ...value, x: n }); }}
+            onBlur={() => setRx(String(value.x))}
+            style={{ ...inputStyle, width: "100%" }}
+          />
+        </label>
+        <label style={axisFieldStyle}>
+          <span style={axisLabelStyle}>Y</span>
+          <input
+            id={id ? `${id}-y` : undefined}
+            name={name ? `${name}_y` : undefined}
+            aria-label={`${label} Y`}
+            type="text"
+            inputMode="decimal"
+            value={ry}
+            onChange={(e) => { setRy(e.target.value); const n = tryParse(e.target.value); if (n !== null) onChange({ ...value, y: n }); }}
+            onBlur={() => setRy(String(value.y))}
+            style={{ ...inputStyle, width: "100%" }}
+          />
+        </label>
+      </div>
+    </div>
+  );
+}
+
 const inputStyle: React.CSSProperties = {
   ...theme.input,
 };
@@ -282,3 +404,46 @@ export function SaveButton({ onClick, disabled }: { onClick: () => void; disable
     </button>
   );
 }
+
+import { formatSavedAt } from "./saveHelpers";
+
+/** "Saved <file> at <time>" acknowledgement shown after a successful save. */
+export function SavedStatus({ filename, at }: { filename: string; at: Date }) {
+  return (
+    <span role="status" style={savedStatusStyle}>
+      ✓ Saved <span style={theme.mono}>{filename}</span> at {formatSavedAt(at)}
+    </span>
+  );
+}
+
+const savedStatusStyle: React.CSSProperties = {
+  fontSize: 12,
+  color: theme.color.successText,
+  whiteSpace: "nowrap",
+};
+
+/** One-line hint under the filename box saying where Save will write. */
+export function SaveTargetHint({ saveAs, selectedFile, exists }: { saveAs: string; selectedFile: string | null; exists: boolean }) {
+  if (saveAs) {
+    return (
+      <span style={saveHintStyle}>
+        Save writes <span style={theme.mono}>{saveAs}</span>
+        {exists && saveAs !== selectedFile ? " — that file already exists and will be overwritten." : " as a new file."}
+      </span>
+    );
+  }
+  if (selectedFile) {
+    return (
+      <span style={saveHintStyle}>
+        Save overwrites <span style={theme.mono}>{selectedFile}</span>. Type a name to save a copy instead.
+      </span>
+    );
+  }
+  return <span style={saveHintStyle}>Type a filename to save this config.</span>;
+}
+
+const saveHintStyle: React.CSSProperties = {
+  fontSize: 11.5,
+  color: theme.color.textMuted,
+  lineHeight: 1.35,
+};

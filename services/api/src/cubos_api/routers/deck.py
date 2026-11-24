@@ -9,12 +9,12 @@ from typing import Any, Dict, Optional
 from cubos.deck import LABWARE_YAML_ENTRY_MODELS, derive_wells_preview, load_deck_from_yaml, resolve_load_names
 from cubos.deck.labware.well_plate import WellPlate
 from cubos.deck.errors import DeckLoaderError
-from cubos.deck.yaml_schema import WellPlateYamlEntry
+from cubos.deck.yaml_schema import TipRackYamlEntry, WellPlateYamlEntry
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
 from cubos_api.config import get_settings
-from cubos_api.services.yaml_io import list_configs, read_yaml, resolve_config_path, write_yaml
+from cubos_api.services.yaml_io import delete_config, list_configs, read_yaml, resolve_config_path, write_yaml
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ class LabwareResponse(BaseModel):
 class DeckResponse(BaseModel):
     filename: str
     labware: list[LabwareResponse]
+    motion_planning: Optional[Dict[str, Any]] = None
 
 
 # ── Routes ─────────────────────────────────────────────────────────────
@@ -97,18 +98,27 @@ def get_deck(filename: str) -> DeckResponse:
             )
         )
 
-    return DeckResponse(filename=filename, labware=items)
+    return DeckResponse(
+        filename=filename,
+        labware=items,
+        motion_planning=raw.get("motion_planning") if isinstance(raw, dict) else None,
+    )
 
 
 @router.post("/preview-wells")
 def preview_wells(body: dict) -> Dict[str, WellPosition]:
-    """Compute well positions from a well plate config using CubOS's
+    """Compute well/tip positions from a calibrated grid config using CubOS's
     calibration logic, without requiring the config to be saved first."""
     try:
-        entry = WellPlateYamlEntry.model_validate(body)
-        resolved_z = entry.a1_point.z
-        if resolved_z is None:
-            raise ValueError("Calibration A1 must include z for preview.")
+        if isinstance(body, dict) and body.get("type") == "tip_rack":
+            tip_rack = TipRackYamlEntry.model_validate(body)
+            entry, resolved_z = tip_rack, tip_rack.pickup_z
+        else:
+            plate = WellPlateYamlEntry.model_validate(body)
+            resolved_z = plate.a1_point.z
+            if resolved_z is None:
+                raise ValueError("Calibration A1 must include z for preview.")
+            entry = plate
         wells = derive_wells_preview(entry, resolved_z=resolved_z)
         return {
             wid: WellPosition(x=round(c.x, 3), y=round(c.y, 3), z=round(c.z, 3))
@@ -131,6 +141,21 @@ def put_deck(filename: str, body: dict) -> DeckResponse:
         raise HTTPException(400, str(e))
     write_yaml(path, payload)
     return get_deck(filename)
+
+
+@router.delete("/{filename}")
+def delete_deck(filename: str) -> dict:
+    from cubos_api.routers import gantry as gantry_router
+
+    if gantry_router.run_active():
+        raise HTTPException(409, "Cannot delete a deck config while a protocol run is active")
+    try:
+        delete_config(get_settings().configs_dir, "deck", filename)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except FileNotFoundError:
+        raise HTTPException(404, f"Config not found: {filename}")
+    return {"status": "deleted", "filename": filename}
 
 
 def _validate_deck_payload(payload: dict) -> None:

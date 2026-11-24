@@ -172,6 +172,67 @@ labware:
     assert plate["y_offset"] == 9.0
 
 
+def test_get_and_put_deck_preserve_motion_metadata(monkeypatch, tmp_path: Path):
+    config_dir = tmp_path / "configs"
+    deck_dir = config_dir / "deck"
+    deck_dir.mkdir(parents=True)
+    metadata = {"clearance_mm": 2.0}
+    labware_motion = {
+        "box": {
+            "anchor": "A1",
+            "offset": {"x": -4.0, "y": -3.0, "z": 0.0},
+            "size": {"x": 20.0, "y": 30.0, "z": 10.0},
+        },
+        "occupied_tip_radius_mm": 4.5,
+        "access": {"transfer": {"strategy": "vertical"}},
+    }
+    deck_path = deck_dir / "routed.yaml"
+    deck_path.write_text(
+        """\
+motion_planning:
+  clearance_mm: 2.0
+labware:
+  plate:
+    type: well_plate
+    name: Routed Plate
+    model_name: sbs_96_wellplate
+    rows: 2
+    columns: 2
+    calibration:
+      a1: {x: 10.0, y: 20.0, z: 30.0}
+      a2: {x: 19.0, y: 20.0, z: 30.0}
+    x_offset: 9.0
+    y_offset: 9.0
+    motion:
+      box:
+        anchor: A1
+        offset: {x: -4.0, y: -3.0, z: 0.0}
+        size: {x: 20.0, y: 30.0, z: 10.0}
+      occupied_tip_radius_mm: 4.5
+      access:
+        transfer: {strategy: vertical}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(get_settings(), "config_dir", config_dir)
+    app = create_app()
+
+    response = api_request(app, "GET", "/api/v1/deck/routed.yaml")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["motion_planning"] == metadata
+    assert payload["labware"][0]["config"]["motion"] == labware_motion
+
+    saved = api_request(app, "PUT", "/api/v1/deck/routed.yaml", json={
+        "motion_planning": metadata,
+        "labware": {"plate": payload["labware"][0]["config"]},
+    })
+    assert saved.status_code == 200
+    assert saved.json()["motion_planning"] == metadata
+    assert saved.json()["labware"][0]["config"]["motion"] == labware_motion
+    assert "motion_planning" in deck_path.read_text(encoding="utf-8")
+
+
 def test_get_deck_uses_public_resolve_load_names(monkeypatch, tmp_path: Path):
     config_dir = tmp_path / "configs"
     deck_dir = config_dir / "deck"
@@ -241,6 +302,53 @@ def test_preview_wells_uses_public_derive_wells_preview(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"A1": {"x": 1.234, "y": 2.346, "z": 3.457}}
     assert calls[0][1] == 30.0
+
+
+def _preview_tip_rack_body() -> dict:
+    return {
+        "type": "tip_rack",
+        "name": "Preview Rack",
+        "rows": 2,
+        "columns": 2,
+        "pickup_z": 43.0,
+        "tip_length": 59.3,
+        "calibration": {
+            "a1": {"x": 168.0, "y": 58.0},
+            "a2": {"x": 177.0, "y": 58.0},
+        },
+        "x_offset": 9.0,
+        "y_offset": 9.0,
+    }
+
+
+def test_preview_wells_derives_tip_rack_positions_at_pickup_z():
+    response = api_request(
+        create_app(),
+        "POST",
+        "/api/v1/deck/preview-wells",
+        json=_preview_tip_rack_body(),
+    )
+
+    assert response.status_code == 200
+    tips = response.json()
+    assert tips["A1"] == {"x": 168.0, "y": 58.0, "z": 43.0}
+    assert tips["B2"] == {"x": 177.0, "y": 49.0, "z": 43.0}
+    assert len(tips) == 4
+
+
+def test_preview_wells_rejects_invalid_tip_rack():
+    body = _preview_tip_rack_body()
+    del body["pickup_z"]
+
+    response = api_request(
+        create_app(),
+        "POST",
+        "/api/v1/deck/preview-wells",
+        json=body,
+    )
+
+    assert response.status_code == 400
+    assert "pickup_z" in response.json()["detail"]
 
 
 def test_preview_wells_requires_a1_z():
@@ -435,3 +543,35 @@ def test_normalize_labware_config_uses_public_labware_schema_mapping(monkeypatch
     )
 
     assert resolved["resolved_field"] == 42
+
+
+def test_delete_deck_removes_file_and_404s_when_missing(monkeypatch, tmp_path: Path):
+    config_dir = tmp_path / "configs"
+    deck_dir = config_dir / "deck"
+    deck_dir.mkdir(parents=True)
+    (deck_dir / "old.yaml").write_text("labware: {}\n", encoding="utf-8")
+    monkeypatch.setattr(get_settings(), "config_dir", config_dir)
+    app = create_app()
+
+    response = api_request(app, "DELETE", "/api/v1/deck/old.yaml")
+    assert response.status_code == 200
+    assert response.json() == {"status": "deleted", "filename": "old.yaml"}
+    assert not (deck_dir / "old.yaml").exists()
+
+    assert api_request(app, "DELETE", "/api/v1/deck/old.yaml").status_code == 404
+    assert api_request(app, "DELETE", "/api/v1/deck/%2e%2e").status_code in (400, 404)
+
+
+def test_delete_deck_refused_while_run_active(monkeypatch, tmp_path: Path):
+    from cubos_api.routers import gantry as gantry_router
+
+    config_dir = tmp_path / "configs"
+    deck_dir = config_dir / "deck"
+    deck_dir.mkdir(parents=True)
+    (deck_dir / "busy.yaml").write_text("labware: {}\n", encoding="utf-8")
+    monkeypatch.setattr(get_settings(), "config_dir", config_dir)
+    monkeypatch.setattr(gantry_router, "run_active", lambda: True)
+
+    response = api_request(create_app(), "DELETE", "/api/v1/deck/busy.yaml")
+    assert response.status_code == 409
+    assert (deck_dir / "busy.yaml").exists()

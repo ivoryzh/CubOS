@@ -25,6 +25,9 @@ instruments:
       opentrons:
         module: cubos.instruments.pipette.vendors.opentrons
         class_name: OpentronsPipette
+      sartorius:
+        module: cubos.instruments.pipette.vendors.sartorius
+        class_name: SartoriusPicus2Pipette
 
   potentiostat:
     interface: cubos.instruments.potentiostat.interface.PotentiostatInstrument
@@ -33,6 +36,9 @@ instruments:
       admiral:
         module: cubos.instruments.potentiostat.vendors.admiral
         class_name: AdmiralPotentiostat
+      emstat:
+        module: cubos.instruments.potentiostat.vendors.emstat
+        class_name: EmstatPotentiostat
 
   uv_curing:
     interface: cubos.instruments.uv_curing.interface.UVCuringInstrument
@@ -60,6 +66,9 @@ instruments:
       pawduino:
         module: cubos.instruments.capper.vendors.pawduino
         class_name: PawduinoCapper
+      nano_text:
+        module: cubos.instruments.capper.vendors.nano_text
+        class_name: NanoTextCapper
 
   camera:
     interface: cubos.instruments.camera.interface.CameraInstrument
@@ -71,6 +80,23 @@ instruments:
       raspberry_pi:
         module: cubos.instruments.camera.vendors.raspberry_pi
         class_name: RaspberryPiCamera
+      flir:
+        module: cubos.instruments.camera.vendors.flir
+        class_name: FlirCamera
+      opencv:
+        module: cubos.instruments.camera.vendors.opencv
+        class_name: OpenCVCamera
+
+  lighting:
+    interface: cubos.instruments.lighting.interface.LightingInstrument
+    calibration_mode: follow_camera
+    vendors:
+      pawduino:
+        module: cubos.instruments.lighting.vendors.pawduino
+        class_name: PawduinoLighting
+      nano_text:
+        module: cubos.instruments.lighting.vendors.nano_text
+        class_name: NanoTextLighting
 
   mounted_tool:
     interface: cubos.instruments.mounted_tool.interface.MountedToolInstrument

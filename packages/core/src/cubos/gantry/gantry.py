@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .calibration_utils import (
     round_mm,
@@ -13,6 +14,7 @@ from .coordinate_translator import (
     to_machine_coordinates,
     translate_status_string,
 )
+from .gantry_config import OriginPolicy
 from .grbl_settings import format_setting_value, normalize_expected_grbl_settings
 from .gantry_driver.driver import DEFAULT_FEED_RATE, Mill
 from .errors import (
@@ -23,6 +25,7 @@ from .errors import (
 )
 from .origin import (
     calculate_deck_origin_z_calibration,
+    calibrated_origin_frame,
     format_set_work_position_command,
 )
 
@@ -56,6 +59,14 @@ class Gantry:
         self._expected_grbl_settings_override: Dict[str, float] | None = None
         self._expected_grbl_settings_source: str | None = None
 
+    def _configured_default_feed_rate(self) -> Optional[float]:
+        """Read cnc.default_feed_rate_mm_min from config, if set."""
+        if isinstance(self.config, dict):
+            cnc = self.config.get("cnc", {})
+            if isinstance(cnc, dict) and "default_feed_rate_mm_min" in cnc:
+                return float(cnc["default_feed_rate_mm_min"])
+        return None
+
     @property
     def factory_z_travel_mm(self) -> Optional[float]:
         """Return configured factory Z travel span, if available."""
@@ -82,6 +93,9 @@ class Gantry:
         if self._offline:
             return
         assert self._mill is not None
+        feed_rate = self._configured_default_feed_rate()
+        if feed_rate is not None:
+            self._mill.default_feed_rate = feed_rate
         try:
             if port is None:
                 self.logger.info("Connecting to gantry via auto-scan")
@@ -242,6 +256,14 @@ class Gantry:
             )
             raise
 
+    def move_linear_to(self, x: float, y: float, z: float) -> None:
+        """Execute one collision-checked straight segment without extra waypoints."""
+        if self._offline:
+            self._offline_coords = {"x": x, "y": y, "z": z}
+            return
+        assert self._mill is not None
+        self._mill.move_linear_to(*to_machine_coordinates(x, y, z))
+
     def jog(
         self,
         x: float = 0,
@@ -263,6 +285,55 @@ class Gantry:
         except (MillConnectionError, CommandExecutionError) as exc:
             self.logger.error("Jog error: %s", exc)
             raise
+
+    def jog_for_calibration(
+        self, *, x: float = 0, y: float = 0, z: float = 0, feed_rate: float = 2000,
+        check_cancelled: Callable[[], None],
+    ) -> str | None:
+        """Await this calibration step's ACK before monitoring completion."""
+        if self._offline:
+            check_cancelled()
+            self.jog(x=x, y=y, z=z, feed_rate=feed_rate)
+            return
+        assert self._mill is not None
+        return self._mill.jog(x=x, y=y, z=z, feed_rate=feed_rate, calibration=True, check_cancelled=check_cancelled)
+
+    def get_calibration_position_info(self) -> Dict[str, Any]:
+        """Read one fresh WPos frame, preserving any queued fault."""
+        if self._offline:
+            return self.get_position_info()
+        assert self._mill is not None
+        raw_status = self._mill.current_status(calibration=True)
+        match = re.search(r"(?:^|\|)WPos:([^|>]+)", raw_status)
+        work_pos = None
+        if match:
+            values = [float(value) for value in match.group(1).split(",")[:3]]
+            if len(values) == 3 and all(math.isfinite(value) for value in values):
+                work_pos = dict(zip(("x", "y", "z"), values))
+        step_mm = {}
+        for axis, code in (("x", "$100"), ("y", "$101"), ("z", "$102")):
+            try:
+                steps = float(self._mill.config[code])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(steps) and steps > 0:
+                step_mm[axis] = 1.0 / steps
+        return {"coords": work_pos, "work_pos": work_pos, "raw_status": raw_status, "step_mm": step_mm,
+                "status": (_STATUS_RE.search(raw_status).group(1) if _STATUS_RE.search(raw_status) else raw_status)}
+
+    def jog_for_limit_recovery(
+        self, x: float = 0, y: float = 0, z: float = 0, feed_rate: float = 100,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> None:
+        """Send the bounded jog after the guarded recovery's fresh pin checks."""
+        if self._offline:
+            self.jog(x=x, y=y, z=z, feed_rate=feed_rate)
+            return
+        axes = [axis for axis, value in (("x", x), ("y", y), ("z", z)) if value]
+        if len(axes) != 1:
+            raise ValueError("Guarded recovery jog requires one axis.")
+        assert self._mill is not None
+        self._mill.jog(x=x, y=y, z=z, feed_rate=feed_rate, recovery_axis=axes[0], check_cancelled=check_cancelled)
 
     def jog_cancel(self) -> None:
         """Cancel any in-progress jog motion immediately."""
@@ -287,7 +358,7 @@ class Gantry:
             raise
 
     def unlock(self) -> None:
-        """Send GRBL unlock command ($X) to clear alarm state."""
+        """Send GRBL unlock command ($X) and await its acknowledgement."""
         if self._offline:
             return
         assert self._mill is not None
@@ -308,6 +379,33 @@ class Gantry:
             self.logger.error("Reset and unlock error: %s", exc)
             raise
 
+    def reset_and_unlock_for_limit_recovery(
+        self, *, axis: str, check_cancelled: Callable[[], None] | None = None,
+    ) -> list[str]:
+        """Reset once, verify the selected switch freshly, then acknowledge unlock."""
+        if axis not in ("x", "y", "z"):
+            raise ValueError("Guarded reset requires an x, y, or z axis.")
+        if self._offline:
+            return []
+        assert self._mill is not None
+        notices = self._mill.soft_reset(recovery_axis=axis) or []
+        if check_cancelled is not None:
+            check_cancelled()
+        status = self.get_recovery_status()
+        pins = re.search(r"Pn:([^|>;\s]*)", status, re.IGNORECASE)
+        if not (
+            re.match(r"^<?(?:idle|alarm)(?:\||>)", status, re.IGNORECASE)
+            and pins and set(pins.group(1).lower()) == {axis}
+        ):
+            raise StatusReturnError(f"Active {axis.upper()} switch did not verify before unlock: {status}")
+        self.logger.info("Guarded reset pre-unlock status: %s", status)
+        if check_cancelled is not None:
+            check_cancelled()
+        self._mill.unlock()
+        if check_cancelled is not None:
+            check_cancelled()
+        return [*notices, f"Pre-unlock status: {status}"]
+
     def get_status(self) -> str:
         """Return the current status string with normalized coordinates."""
         if self._offline:
@@ -318,6 +416,17 @@ class Gantry:
         except (MillConnectionError, StatusReturnError) as exc:
             self.logger.error("Error getting status: %s", exc)
             raise
+
+    def get_recovery_status(self) -> str:
+        """Read a fresh status frame, tolerating only Check Limits courtesy messages."""
+        if self._offline:
+            return "Idle"
+        assert self._mill is not None
+        return translate_status_string(self._mill.current_status(recovery=True))
+
+    def get_recovery_position_info(self) -> Dict[str, Any]:
+        """Read fresh recovery coordinates without hiding controller faults."""
+        return self.get_position_info(recovery=True)
 
     def stop(self) -> None:
         """Immediately stop all gantry motion (GRBL feed hold)."""
@@ -360,20 +469,21 @@ class Gantry:
         coords = self._mill.current_coordinates()
         return {"x": float(coords.x), "y": float(coords.y), "z": float(coords.z)}
 
-    def get_position_info(self) -> Dict[str, Any]:
+    def get_position_info(self, *, recovery: bool = False) -> Dict[str, Any]:
         """Return coordinates, work position, and last-known status."""
         if self._offline:
             coords = dict(self._offline_coords)
             return {"coords": dict(coords), "work_pos": dict(coords), "status": "Idle"}
 
         assert self._mill is not None
-        coords = self._mill.current_coordinates()
+        coords = self._mill.current_coordinates(recovery=True) if recovery else self._mill.current_coordinates()
         user_coords = {"x": float(coords.x), "y": float(coords.y), "z": float(coords.z)}
         status = self._extract_status()
         return {
             "coords": dict(user_coords),
             "work_pos": dict(user_coords),
             "status": status,
+            "raw_status": self._mill.last_status,
         }
 
     def set_serial_timeout(self, timeout: float) -> None:
@@ -538,6 +648,21 @@ class Gantry:
         """Enable or disable GRBL soft limits through Gantry semantics."""
         self.set_grbl_setting("$20", 1 if enabled else 0)
 
+    def hard_limits_enabled(self) -> bool | None:
+        """Return whether GRBL hard limits ($21) are enabled, if readable."""
+        settings = self.read_grbl_settings()
+        raw = settings.get("$21", settings.get("21"))
+        if raw is None:
+            return None
+        try:
+            return float(raw) != 0.0
+        except (TypeError, ValueError):
+            return None
+
+    def set_hard_limits_enabled(self, enabled: bool) -> None:
+        """Enable or disable GRBL hard limits through Gantry semantics."""
+        self.set_grbl_setting("$21", 1 if enabled else 0)
+
     def homing_pull_off_mm(self) -> float:
         """Return GRBL $27 homing pull-off in millimeters."""
         if self._offline:
@@ -681,15 +806,18 @@ class Gantry:
         homing_pull_off: float | None = None,
         hard_limits: float | int | bool | None = None,
         tolerance_mm: float = 0.001,
+        origin_policy: str | None = None,
     ) -> Dict[str, Any]:
-        """Finalize single-instrument deck-origin calibration on the controller.
+        """Finalize the selected origin for single- or multi-instrument calibration.
 
-        The current physical pose must already have been assigned to deck-origin
-        X=0, Y=0, Z=block_height. This method measures the homed top pose,
-        programs GRBL travel spans, re-homes against the new span, then assigns
-        that top pose to the calibrated deck-frame maxima so G54 and soft limits
-        agree.
+        Provisional G54 must already define the XY reference and block height.
+        Measure positive spans there, program and verify limits, then home again.
+        Persist the selected frame at that known corner and verify WPos before
+        returning bounds that may be saved.
         """
+        origin_policy = OriginPolicy(
+            self.config.get("origin_policy", "deck_origin") if origin_policy is None else origin_policy
+        ).value
         z_calibration = calculate_deck_origin_z_calibration(
             home_z=home_z,
             block_touch_z=block_touch_z,
@@ -730,23 +858,25 @@ class Gantry:
                     z_calibration.max_travel_z + homing_pull_off_mm
                 ),
             }
-            self._offline_coords = {
-                "x": measured_volume["x"],
-                "y": measured_volume["y"],
-                "z": measured_volume["z"],
-            }
+            working_volume, target_position = calibrated_origin_frame(
+                origin_policy, measured_volume,
+                z_min=z_calibration.z_min, z_max=z_calibration.z_max,
+            )
+            self._offline_coords = target_position
             return {
                 "measured_volume": measured_volume,
                 "z_calibration": z_calibration.as_dict(),
                 "max_travel": max_travel,
                 "homing_pull_off_mm": homing_pull_off_mm,
                 "position": dict(self._offline_coords),
+                "origin_policy": origin_policy,
+                "working_volume": working_volume,
             }
 
         self.home()
         measured = self.get_coordinates()
         expected_z_max = z_calibration.z_max
-        if abs(float(measured["z"]) - expected_z_max) > tolerance_mm:
+        if not math.isfinite(float(measured["z"])) or abs(float(measured["z"]) - expected_z_max) > tolerance_mm:
             raise MillConnectionError(
                 "Homed Z after assigning the block origin did not match the "
                 "calculated calibrated Z maximum: "
@@ -781,6 +911,10 @@ class Gantry:
             ),
         }
 
+        working_volume, target_position = calibrated_origin_frame(
+            origin_policy, measured_volume,
+            z_min=z_calibration.z_min, z_max=z_calibration.z_max,
+        )
         self.configure_soft_limits_from_spans(
             max_travel_x=max_travel["x"],
             max_travel_y=max_travel["y"],
@@ -790,14 +924,26 @@ class Gantry:
             hard_limits=hard_limits,
             tolerance_mm=tolerance_mm,
         )
+        self.home()
         self.activate_work_coordinate_system("G54")
         self.clear_g92_offsets()
         self.set_work_coordinates(
-            x=measured_volume["x"],
-            y=measured_volume["y"],
-            z=z_calibration.z_max,
+            x=target_position["x"],
+            y=target_position["y"],
+            z=target_position["z"],
         )
         final_position = self.get_coordinates()
+        for axis, target in target_position.items():
+            actual = float(final_position[axis])
+            if (
+                not math.isfinite(actual)
+                or abs(actual - target) > tolerance_mm
+                or not working_volume[f"{axis}_min"] <= actual <= working_volume[f"{axis}_max"]
+            ):
+                raise MillConnectionError(
+                    f"Calibrated {origin_policy} WPos did not verify on {axis}: "
+                    f"got {actual:g}, expected {target:g}. Recalibrate before saving."
+                )
 
         return {
             "measured_volume": measured_volume,
@@ -805,6 +951,8 @@ class Gantry:
             "max_travel": max_travel,
             "homing_pull_off_mm": homing_pull_off_mm,
             "position": final_position,
+            "origin_policy": origin_policy,
+            "working_volume": working_volume,
         }
 
     def _extract_status(self) -> str:

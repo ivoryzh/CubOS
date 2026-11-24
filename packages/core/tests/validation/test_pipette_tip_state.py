@@ -173,6 +173,60 @@ def test_transfer_without_prior_tip_pickup_violates():
     assert any("requires an attached pipette tip" in v.message for v in violations)
 
 
+def test_mix_finish_is_included_in_bounds_and_semantics():
+    protocol = _protocol(
+        _step(0, "pick_up_tip", position="tips.A1"),
+        _step(1, "mix", position="plate.A1", volume_ul=25, height=-5, blowout_height=100),
+    )
+    deck, gantry, board = _deck(tip_length=42), _gantry(z_max=85, safe_z=80), _board(depth=-42)
+    bounds = validate_protocol_motion_bounds(gantry, protocol, deck, board)
+    semantics = validate_protocol_semantics(protocol, board, deck, gantry)
+    assert any(v.z == 112 and v.bound_name == "z_max" for v in bounds)
+    assert any("mix blowout" in v.message and "112" in v.message for v in semantics)
+
+
+@pytest.mark.parametrize("height", [float("nan"), float("inf"), True, "bad"])
+def test_mix_finish_invalid_height_is_reported(height, caplog):
+    from cubos.validation.bounds import collect_protocol_motion_targets
+
+    protocol = _protocol(
+        _step(0, "pick_up_tip", position="tips.A1"),
+        _step(1, "mix", position="plate.A1", volume_ul=25, height=-5, blowout_height=height),
+    )
+    deck, gantry, board = _deck(), _gantry(), _board()
+    violations = validate_protocol_semantics(protocol, board, deck, gantry)
+    assert any("blowout_height must be a finite number" in v.message for v in violations)
+    collect_protocol_motion_targets(gantry, protocol, deck)
+    assert "blowout_height" in caplog.text
+
+
+def test_mix_default_finish_target_is_the_reference_height():
+    from cubos.validation.bounds import collect_protocol_motion_targets
+
+    protocol = _protocol(
+        _step(0, "pick_up_tip", position="tips.A1"),
+        _step(1, "mix", position="plate.A1", volume_ul=25, height=-5),
+    )
+    targets = collect_protocol_motion_targets(_gantry(), protocol, _deck())
+    action_heights = [t.z for t in targets if t.labware_key == "plate" and t.position_id.endswith("action_z")]
+    assert action_heights == [7, 12]
+
+
+@pytest.mark.parametrize("repetitions", [0, 1])
+def test_rinse_well_checks_the_inherited_mix_finish(repetitions):
+    protocol = _protocol(
+        _step(0, "pick_up_tip", position="tips.A1"),
+        _step(1, "rinse_well", well="plate.A1", source="plate.A2", waste="waste",
+              volume_ul=25, well_height=-20, mix_repetitions=repetitions),
+    )
+    deck, gantry, board = _deck(tip_length=42), _gantry(z_max=85, safe_z=80), _board(depth=-42)
+    deck["plate"].wells["A1"] = Coordinate3D(x=90, y=30, z=90)
+    semantics = validate_protocol_semantics(protocol, board, deck, gantry)
+    bounds = validate_protocol_motion_bounds(gantry, protocol, deck, board)
+    assert any("rinse_well mix blowout" in v.message for v in semantics) == bool(repetitions)
+    assert any(v.z == 90 and v.bound_name == "z_max" for v in bounds) == bool(repetitions)
+
+
 def test_tip_rack_defaults_to_opentrons_300ul_tip_length():
     rack = _tip_rack()
 
@@ -324,13 +378,13 @@ def test_home_with_attached_tip_over_right_rail_fails():
         protocol,
         _board(depth=0.0, offset_x=100.0),
         _deck(tip_x=140.0),
-        _gantry(x_max=400.0, y_max=260.0, z_max=150.0, safe_z=85.0),
+        _gantry(x_max=400.0, y_max=260.0, z_max=130.0, safe_z=85.0),
     )
 
     assert any(
         "home pose" in v.message
         and "Cub XL right X-max rail" in v.message
-        and "(500.0, 260.0, 90.7)" in v.message
+        and "(500.0, 260.0, 70.7)" in v.message
         for v in violations
     ), violations
 
@@ -421,3 +475,80 @@ def test_non_finite_pipette_height_names_offending_field():
     )
 
     assert any("destination_height must be a finite number" in v.message for v in violations)
+
+
+def _multi_dispense_protocol(**overrides):
+    args = {"source": "plate.A1", "destinations": ["plate.A2", "waste"], "volumes": [40, 60]}
+    args.update(overrides)
+    return _protocol(
+        _step(0, "pick_up_tip", position="tips.A1"),
+        _step(1, "multi_dispense", **args),
+        _step(2, "drop_tip", position="waste"),
+    )
+
+
+def _multi_dispense_board():
+    from cubos.instruments.pipette.models import PIPETTE_MODELS
+
+    board = _board()
+    board.instruments["pipette"].config = PIPETTE_MODELS["p300_single_gen2"]
+    return board
+
+
+def test_multi_dispense_validates_every_target_with_attached_tip():
+    protocol = _multi_dispense_protocol(source_height=-2, destination_height=3)
+    assert validate_protocol_semantics(protocol, _multi_dispense_board(), _deck(), _gantry()) == []
+    assert validate_protocol_motion_bounds(_gantry(), protocol, _deck(), _multi_dispense_board()) == []
+
+
+@pytest.mark.parametrize("args,match", [
+    ({"volumes": [150, 100]}, "exceeds pipette capacity"),
+    ({"volumes": [40]}, "one volume per destination"),
+    ({"destinations": ["plate.A2", "missing"]}, "missing"),
+    ({"destination_height": 100}, "safe_z"),
+    ({"source_height": float("nan")}, "finite"),
+])
+def test_multi_dispense_semantics_reject_invalid_batch(args, match):
+    errors = validate_protocol_semantics(
+        _multi_dispense_protocol(**args), _multi_dispense_board(), _deck(), _gantry(),
+    )
+    assert any(match in error.message for error in errors)
+
+
+def test_multi_dispense_requires_tip():
+    protocol = _protocol(_step(
+        0, "multi_dispense", source="plate.A1", destinations=["plate.A2"], volumes=[40],
+    ))
+    errors = validate_protocol_semantics(protocol, _multi_dispense_board(), _deck(), _gantry())
+    assert any("requires an attached pipette tip" in error.message for error in errors)
+
+
+def test_multi_dispense_bounds_include_last_destination_and_tip_extension():
+    from cubos.validation.bounds import collect_protocol_motion_targets
+
+    targets = collect_protocol_motion_targets(_gantry(), _multi_dispense_protocol(), _deck())
+    assert any(t.labware_key == "waste" and t.tip_extension == DEFAULT_TEST_TIP_LENGTH for t in targets)
+    errors = validate_protocol_motion_bounds(
+        _gantry(x_max=110), _multi_dispense_protocol(), _deck(), _multi_dispense_board(),
+    )
+    assert any(error.labware_key == "waste" and error.axis == "x" for error in errors)
+
+
+def test_standalone_dispense_requires_tip():
+    protocol = _protocol(_step(0, "dispense", position="plate.A1", volume_ul=25.0))
+    violations = validate_protocol_semantics(protocol, _board(), _deck(), _gantry())
+    assert any("requires an attached pipette tip" in v.message for v in violations)
+
+
+def test_standalone_dispense_validates_attached_tip_height():
+    protocol = _protocol(
+        _step(0, "pick_up_tip", position="tips.A1"),
+        _step(1, "dispense", position="plate.A2", height=20.0, volume_ul=25.0),
+    )
+    violations = validate_protocol_motion_bounds(
+        _gantry(z_max=60.0, safe_z=40.0), protocol, _deck(), _board(depth=5.0),
+    )
+    assert any(
+        v.position_id == "A2.action_z" and v.axis == "z" and v.bound_name == "z_max"
+        for v in violations
+    )

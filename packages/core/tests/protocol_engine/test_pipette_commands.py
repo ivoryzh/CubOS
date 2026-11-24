@@ -44,7 +44,7 @@ def _mock_context(
         pipette = MagicMock()
         pipette.aspirate.return_value = MagicMock(success=True, volume_ul=100.0)
         pipette.dispense.return_value = MagicMock(success=True, volume_ul=100.0)
-        pipette.mix.return_value = MagicMock(success=True, volume_ul=50.0, repetitions=3)
+        pipette.mix.return_value = MagicMock(success=True, volume_ul=50.0, cycles=3)
         # Default: pipette's instrument-config measurement_height is 0 (well surface).
         board.instruments = {"pipette": pipette}
     else:
@@ -137,6 +137,21 @@ class TestAspirateCommand:
         ctx = _mock_context(resolve_return=coord)
         aspirate(ctx, position="plate_1.A1", volume_ul=100.0)
         ctx.gantry.move_to_labware.assert_called_once_with("pipette", coord)
+
+    def test_applies_signed_xy_offsets(self):
+        from cubos.protocol_engine.commands.pipette import aspirate
+
+        ctx = _mock_context(resolve_return=Coordinate3D(x=10.0, y=20.0, z=75.0))
+        aspirate(
+            ctx, position="plate_1.A1", volume_ul=10.0,
+            x_offset_mm=2.0, y_offset_mm=-3.0,
+        )
+        ctx.gantry.move_to_labware.assert_called_once_with(
+            "pipette", (12.0, 17.0, 75.0),
+        )
+        ctx.gantry.move.assert_called_once_with(
+            "pipette", (12.0, 17.0, 75.0),
+        )
 
     def test_descends_to_well_bottom_after_approach(self):
         """aspirate descends to the labware reference Z by default."""
@@ -274,6 +289,18 @@ class TestBlowoutCommand:
             blowout(ctx, position="plate_1.A1")
 
 
+class TestPipetteHomeCommand:
+
+    def test_homes_without_gantry_motion(self):
+        from cubos.protocol_engine.commands.pipette import pipette_home
+
+        ctx = _mock_context()
+        pipette_home(ctx)
+        _get_pipette(ctx).home.assert_called_once_with()
+        ctx.gantry.move.assert_not_called()
+        ctx.gantry.move_to_labware.assert_not_called()
+
+
 # ─── mix tests ────────────────────────────────────────────────────────────────
 
 
@@ -292,24 +319,30 @@ class TestMixCommand:
         ctx = _mock_context()
         call_order = []
         ctx.gantry.move_to_labware.side_effect = lambda *a, **kw: call_order.append("move")
-        _get_pipette(ctx).mix.side_effect = lambda *a: call_order.append("mix")
+        _get_pipette(ctx).mix.side_effect = lambda *a, **kw: call_order.append("mix")
 
         mix(ctx, position="plate_1.A1", volume_ul=50.0)
         assert call_order == ["move", "mix"]
 
-    def test_passes_volume_repetitions_and_speed(self):
+    def test_passes_volume_cycles_speed_and_engaged_tip(self):
         from cubos.protocol_engine.commands.pipette import mix
 
         ctx = _mock_context()
-        mix(ctx, position="plate_1.A1", volume_ul=50.0, repetitions=5, speed=20.0)
-        _get_pipette(ctx).mix.assert_called_once_with(50.0, 5, 20.0)
+        mix(ctx, position="plate_1.A1", volume_ul=50.0, cycles=5, speed=20.0, height=-3.0)
+        _get_pipette(ctx).mix.assert_called_once_with(
+            50.0, 5, 20.0,
+            gantry=ctx.gantry, position=(100.0, 50.0, PIPETTE_HEIGHT_MM - 3.0),
+        )
 
-    def test_default_repetitions_and_speed(self):
+    def test_default_cycles_and_speed(self):
         from cubos.protocol_engine.commands.pipette import mix
 
         ctx = _mock_context()
         mix(ctx, position="plate_1.A1", volume_ul=50.0)
-        _get_pipette(ctx).mix.assert_called_once_with(50.0, 3, 50.0)
+        _get_pipette(ctx).mix.assert_called_once_with(
+            50.0, 3, 50.0,
+            gantry=ctx.gantry, position=(100.0, 50.0, PIPETTE_HEIGHT_MM),
+        )
 
     def test_raises_when_no_pipette(self):
         from cubos.protocol_engine.commands.pipette import mix
@@ -339,24 +372,87 @@ class TestMixCommand:
         ctx.gantry.move_to_labware.side_effect = (
             lambda *args, **kwargs: events.append("move")
         )
-        _get_pipette(ctx).mix.side_effect = lambda *args: events.append("mix")
+        _get_pipette(ctx).mix.side_effect = lambda *args, **kwargs: events.append("mix")
+        ctx.gantry.move.side_effect = lambda *args, **kwargs: events.append("position")
+        _get_pipette(ctx).blowout.side_effect = lambda *args: events.append("blowout")
 
         mix(
             ctx,
             position="plate.A1",
             volume_ul=25.0,
-            repetitions=4,
+            cycles=4,
             speed=20.0,
         )
 
-        assert events == ["begin", "move", "mix", "complete"]
+        assert events == ["begin", "move", "position", "mix", "position", "blowout", "complete"]
         store.begin_fluid_mix.assert_called_once()
         args = store.begin_fluid_mix.call_args.args
         assert args[0] == 11
         assert args[1].endswith(":mix")
         assert (args[2].labware_key, args[2].location_id) == ("plate", "A1")
         assert args[3:] == (25.0, 4, 20.0, 0.0)
-        assert store.begin_fluid_mix.call_args.kwargs == {"campaign_id": 7}
+        assert store.begin_fluid_mix.call_args.kwargs == {
+            "campaign_id": 7, "blowout_height": 0.0,
+        }
+
+    @pytest.mark.parametrize("blowout_height", [0.0, 3.0])
+    def test_legacy_finish_lifts_in_same_well_before_one_blowout(self, blowout_height):
+        from cubos.protocol_engine.commands.pipette import mix
+
+        ctx = _mock_context()
+        events = []
+        ctx.gantry.move.side_effect = lambda instrument, target: events.append(target)
+        _get_pipette(ctx).mix.side_effect = lambda *args, **kwargs: events.append("mix")
+        _get_pipette(ctx).blowout.side_effect = lambda speed: events.append(("blowout", speed))
+
+        mix(ctx, "plate_1.A1", 50, height=-5, speed=25, blowout_height=blowout_height)
+
+        assert events == [
+            (100, 50, PIPETTE_HEIGHT_MM - 5),
+            "mix",
+            (100, 50, PIPETTE_HEIGHT_MM + blowout_height),
+            ("blowout", 25),
+        ]
+        ctx.gantry.move_to_labware.assert_called_once()
+
+    @pytest.mark.parametrize("blowout_height", [float("nan"), float("inf"), True, "bad"])
+    def test_invalid_blowout_height_rejected_before_motion(self, blowout_height):
+        from cubos.protocol_engine.commands.pipette import mix
+
+        ctx = _mock_context()
+        with pytest.raises(ProtocolExecutionError, match="blowout_height.*finite"):
+            mix(ctx, "plate_1.A1", 50, blowout_height=blowout_height)
+        ctx.gantry.move_to_labware.assert_not_called()
+        ctx.gantry.move.assert_not_called()
+        _get_pipette(ctx).mix.assert_not_called()
+
+    @pytest.mark.parametrize("failure_phase", ["move", "blowout"])
+    def test_legacy_finish_failure_is_not_committed(self, failure_phase):
+        from cubos.gantry.gantry_driver.exceptions import MillConnectionError
+        from cubos.protocol_engine.commands.pipette import mix
+
+        ctx = _mock_context()
+        ctx.campaign_id = 7
+        ctx.fluid_state_id = 11
+        ctx.data_store = MagicMock()
+        ctx.data_store.begin_fluid_mix.return_value = True
+        ctx.deck.resolve_labware_target.return_value = SimpleNamespace(
+            labware_key="plate", location_id="A1",
+        )
+        failure = MillConnectionError("finish interrupted")
+        if failure_phase == "move":
+            ctx.gantry.move.side_effect = [None, failure]
+        else:
+            _get_pipette(ctx).blowout.side_effect = failure
+
+        with pytest.raises(MillConnectionError) as raised:
+            mix(ctx, "plate.A1", 25, height=-5)
+
+        assert raised.value is failure
+        ctx.data_store.complete_fluid_mix.assert_not_called()
+        ctx.data_store.mark_fluid_reconciliation_required.assert_called_once()
+        if failure_phase == "move":
+            _get_pipette(ctx).blowout.assert_not_called()
 
     def test_tracked_mix_skips_exact_already_applied_replay_without_motion(self):
         from cubos.protocol_engine.commands.pipette import mix
@@ -373,6 +469,7 @@ class TestMixCommand:
         assert mix(ctx, position="plate.A1", volume_ul=25.0) is None
         ctx.gantry.move_to_labware.assert_not_called()
         _get_pipette(ctx).mix.assert_not_called()
+        _get_pipette(ctx).blowout.assert_not_called()
         ctx.data_store.complete_fluid_mix.assert_not_called()
 
     def test_tracked_mix_failure_requires_reconciliation(self):
@@ -834,6 +931,24 @@ class TestTransferCommand:
 
         pip.aspirate.assert_called_once_with(100.0, 50.0)
         pip.dispense.assert_called_once_with(100.0, 50.0)
+
+    def test_transfer_always_blows_out_with_speed_after_dispense(self):
+        from cubos.protocol_engine.commands.pipette import transfer
+
+        ctx = _mock_context_multi_resolve()
+        pip = ctx.gantry.instruments["pipette"]
+        call_order = []
+        pip.aspirate.side_effect = lambda *a: call_order.append("aspirate")
+        pip.dispense.side_effect = lambda *a: call_order.append("dispense")
+        pip.blowout.side_effect = lambda *a: call_order.append("blowout")
+
+        transfer(
+            ctx, source="plate_1.A1", destination="plate_1.B1", volume_ul=100.0,
+            speed=40.0,
+        )
+
+        pip.blowout.assert_called_once_with(40.0)
+        assert call_order == ["aspirate", "dispense", "blowout"]
 
     def test_tracked_transfer_journals_before_liquid_and_commits_after_dispense(self):
         from cubos.protocol_engine.commands.pipette import transfer
@@ -1442,3 +1557,30 @@ class TestSerialTransferCommand:
                 ctx, source="vial_1", plate="plate_1", axis="A",
                 volumes=[10.0],
             )
+
+
+def test_standalone_blowout_rejects_durable_fluid_tracking_before_motion():
+    from cubos.protocol_engine.commands.pipette import blowout
+
+    ctx = _mock_context()
+    ctx.deck.planning_enabled = True
+    ctx.data_store = MagicMock()
+    ctx.fluid_state_id = 3
+    ctx.campaign_id = 4
+    with pytest.raises(ProtocolExecutionError, match="Standalone blowout"):
+        blowout(ctx, position="plate_1.A1")
+    ctx.gantry.move_to_labware.assert_not_called()
+    ctx.gantry.move.assert_not_called()
+    _get_pipette(ctx).blowout.assert_not_called()
+
+
+def test_dispense_registry_summary_and_required_volume():
+    from pydantic import ValidationError
+    from cubos.protocol_engine.registry import CommandRegistry
+
+    command = CommandRegistry.instance().get("dispense")
+    assert command.describe({"position": "plate.A1", "volume_ul": 100}) == "100 µL   into plate.A1"
+    with pytest.raises(ValidationError):
+        command.schema.model_validate({"position": "plate.A1"})
+    with pytest.raises(ValidationError):
+        command.schema.model_validate({"position": "plate.A1", "volume_ul": 100, "unknown": True})

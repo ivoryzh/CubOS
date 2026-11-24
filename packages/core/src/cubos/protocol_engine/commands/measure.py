@@ -9,6 +9,7 @@ from typing import Any, Dict, TYPE_CHECKING
 from ..errors import ProtocolExecutionError
 from ..measurements import normalize_measurement
 from ..registry import protocol_command
+from . import _summaries
 from ..scan_args import normalize_scan_arguments, surface_detection_enabled
 from ._dispatch import inject_runtime_args
 from ._fluid_contents import (
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@protocol_command("measure")
+@protocol_command("measure", summary=_summaries.measure)
 def measure(
     context: ProtocolContext,
     instrument: str,
@@ -33,6 +34,8 @@ def measure(
     method: str = "measure",
     indentation_limit_height: float | None = None,
     method_kwargs: Dict[str, Any] = {},
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> Any:
     """Measure at a deck position using *instrument*.
 
@@ -121,10 +124,12 @@ def measure(
         raise
 
     try:
-        well_z, action_z = engage_at_labware(
+        _, _, well_z, action_z = engage_at_labware(
             context, instrument, position,
             measurement_height=measurement_height,
             command_label="measure",
+            x_offset_mm=x_offset_mm,
+            y_offset_mm=y_offset_mm,
         )
     except ValueError as exc:
         raise ProtocolExecutionError(str(exc)) from exc

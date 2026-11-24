@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional
+
+from pydantic import StrictFloat
 
 from cubos.deck.labware.tip_rack import (
     TipRackResolutionError,
@@ -16,6 +20,11 @@ from cubos.instruments.pipette.liquid_class import IDENTITY_CORRECTION
 
 from ..errors import ProtocolExecutionError
 from ..registry import protocol_command
+from ..pipette_routing import (
+    PipetteTravelClearance,
+    validate_pipette_travel_clearance,
+)
+from . import _summaries
 from ._cap_preflight import require_uncapped as _require_uncapped
 from ._liquid_selection import (
     LiquidSelectionError,
@@ -27,14 +36,21 @@ from ._liquid_transfer import (
     LiquidTransferPreflightError,
     derive_liquid_relative_height,
     pipette_capacity,
+    plan_multi_dispense,
     plan_strokes,
     validate_dead_volume,
     validate_destination_overflow,
     vial_for_target,
 )
-from ._movement import engage_at_labware
+from ._movement import _assert_finite_number, engage_at_labware
 
 logger = logging.getLogger(__name__)
+
+# Reason text for steps the durable fluid/tip journal reports as already
+# applied on a resumed run. Deliberately distinct from "never reached": the
+# operator needs to read a resumed run as having done this work, just not in
+# this process.
+_ALREADY_APPLIED = "already applied on a previous run"
 
 if TYPE_CHECKING:
     from ..runtime import ProtocolContext
@@ -56,20 +72,24 @@ def _engage(
     *,
     command_label: str,
     height: float = 0.0,
-) -> float:
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
+) -> tuple[float, float, float]:
     """Wrap ``engage_at_labware`` so configuration errors surface as
     ``ProtocolExecutionError`` instead of bare ``ValueError``s — matching
     how ``measure`` and ``scan`` handle their command boundary.
 
     Pipette commands default to the resolved labware coordinate
     (``height=0``). ``height`` is a labware-relative
-    offset in the same convention as ``measurement_height`` for measure/scan."""
+    offset in the same convention as ``measurement_height`` for measure/scan.
+    Returns the engaged tip ``(x, y, z)``."""
     try:
-        _, action_z = engage_at_labware(
+        x, y, _, action_z = engage_at_labware(
             context, "pipette", position,
             measurement_height=height, command_label=command_label,
+            x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
         )
-        return action_z
+        return x, y, action_z
     except ValueError as exc:
         raise ProtocolExecutionError(str(exc)) from exc
 
@@ -94,6 +114,51 @@ def _tracked_fluid_state(context: ProtocolContext) -> bool:
             f"set but {', '.join(missing)} is missing. No motion was attempted."
         )
     return True
+
+
+def _blowout_retract_z(
+    context: ProtocolContext,
+    pipette: Any,
+    position: str,
+    height: float,
+) -> float | None:
+    if getattr(pipette, "requires_home_after_blowout", False) is not True:
+        return None
+    try:
+        safe_z = context.gantry.safe_z
+        _assert_finite_number(safe_z, field_name="safe_z", source="blowout")
+        _assert_finite_number(height, field_name="height", source="blowout")
+        surface_z = context.deck.resolve_coordinate(position).z
+        _assert_finite_number(surface_z, field_name="surface_z", source="blowout")
+    except (AttributeError, KeyError, ValueError) as exc:
+        raise ProtocolExecutionError(
+            f"Cannot establish clearance for blowout at {position!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if safe_z <= max(surface_z, surface_z + height):
+        raise ProtocolExecutionError(
+            f"blowout at {position!r} requires safe_z above both the labware "
+            "surface and action height before returning the piston home."
+        )
+    return float(safe_z)
+
+
+def _blowout_and_retract(
+    context: ProtocolContext,
+    pipette: Any,
+    tip_position: tuple[float, float, float],
+    speed: float,
+    retract_z: float | None,
+    planned_retract: Any = None,
+) -> None:
+    pipette.blowout(speed)
+    if retract_z is not None:
+        if planned_retract is not None:
+            context.routing_session.execute(planned_retract)
+        else:
+            x, y, _ = tip_position
+            context.gantry.move("pipette", (x, y, retract_z))
+        pipette.home()
 
 
 def _parse_position(position: str) -> tuple[str, Optional[str]]:
@@ -162,9 +227,10 @@ def _begin_tracked_mix(
     *,
     position: str,
     volume_ul: float,
-    repetitions: int,
+    cycles: int,
     speed: float,
     height: float,
+    blowout_height: float,
 ) -> tuple[str, bool]:
     target = _resolve_fluid_target(context, position)
     try:
@@ -174,10 +240,11 @@ def _begin_tracked_mix(
             operation_key,
             target,
             volume_ul,
-            repetitions,
+            cycles,
             speed,
             height,
             campaign_id=context.campaign_id,
+            blowout_height=blowout_height,
         )
     except Exception as exc:
         raise ProtocolExecutionError(
@@ -284,15 +351,47 @@ def _mark_tip_uncertain(
         )
 
 
-@protocol_command("aspirate")
+def _planned_tip_position(context: ProtocolContext, plan: Any) -> tuple[float, float, float]:
+    pipette = _get_pipette(context)
+    return (
+        plan.end.x + pipette.offset_x,
+        plan.end.y + pipette.offset_y,
+        plan.end.z - pipette.effective_depth,
+    )
+
+
+def _engage_standalone(
+    context: ProtocolContext, position: str, *, command: str, height: float,
+    x_offset_mm: float = 0.0, y_offset_mm: float = 0.0,
+) -> tuple[float, float, float]:
+    if getattr(context.deck, "planning_enabled", False) is True:
+        from ..routing import prepared_step
+
+        planned = prepared_step(context, command)
+        context.routing_session.execute(planned.plans[0])
+        return _planned_tip_position(context, planned.plans[0])
+    return _engage(
+        context, position, command_label=command, height=height,
+        x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
+    )
+
+
+@protocol_command("aspirate", summary=_summaries.aspirate)
 def aspirate(
     context: ProtocolContext,
     position: str,
     volume_ul: float,
     speed: float = 50.0,
     height: float = 0.0,
+    travel_clearance: PipetteTravelClearance = 3.0,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> Any:
     """Move pipette to *position*, then aspirate."""
+    try:
+        validate_pipette_travel_clearance(travel_clearance)
+    except ValueError as exc:
+        raise ProtocolExecutionError(str(exc)) from exc
     if _tracked_fluid_state(context):
         raise ProtocolExecutionError(
             "Standalone aspirate is disabled while durable fluid tracking is "
@@ -300,75 +399,165 @@ def aspirate(
             "known destination. Use transfer or serial_transfer."
         )
     pipette = _get_pipette(context)
-    _engage(context, position, command_label="aspirate", height=height)
+    _engage_standalone(
+        context, position, command="aspirate", height=height,
+        x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
+    )
     return pipette.aspirate(volume_ul, speed)
 
 
+@protocol_command("dispense", summary=_summaries.dispense)
 def dispense(
     context: ProtocolContext,
     position: str,
     volume_ul: float,
     speed: float = 50.0,
     height: float = 0.0,
+    travel_clearance: PipetteTravelClearance = 3.0,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> Any:
-    """Move pipette to *position*, then dispense.
-
-    Not exposed as a YAML protocol command — use ``transfer`` instead,
-    which correctly tracks source labware for DB logging.
-    """
+    """Move pipette to *position*, then dispense without durable fluid tracking."""
+    try:
+        validate_pipette_travel_clearance(travel_clearance)
+    except ValueError as exc:
+        raise ProtocolExecutionError(str(exc)) from exc
     if _tracked_fluid_state(context):
         raise ProtocolExecutionError(
             "Standalone dispense is disabled while durable fluid tracking is "
             "active because its source is unknown. Use transfer or serial_transfer."
         )
     pipette = _get_pipette(context)
-    _engage(context, position, command_label="dispense", height=height)
+    _engage_standalone(
+        context, position, command="dispense", height=height,
+        x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
+    )
     return pipette.dispense(volume_ul, speed)
 
 
-@protocol_command("blowout")
+@protocol_command("blowout", summary=_summaries.blowout)
 def blowout(
     context: ProtocolContext,
     position: str,
     speed: float = 50.0,
     height: float = 0.0,
+    travel_clearance: PipetteTravelClearance = 3.0,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> None:
-    """Move pipette to *position*, then blowout."""
+    """Blow out at *position*, retracting before any required piston reset."""
+    try:
+        validate_pipette_travel_clearance(travel_clearance)
+    except ValueError as exc:
+        raise ProtocolExecutionError(str(exc)) from exc
+    if getattr(context.deck, "planning_enabled", False) is True and _tracked_fluid_state(context):
+        raise ProtocolExecutionError(
+            "Standalone blowout is disabled while durable fluid tracking is "
+            "active because its source and volume are unknown. Use transfer "
+            "for tracked liquid handling."
+        )
     pipette = _get_pipette(context)
-    _engage(context, position, command_label="blowout", height=height)
-    pipette.blowout(speed)
+    retract_z = _blowout_retract_z(context, pipette, position, height)
+    tip_position = _engage_standalone(
+        context, position, command="blowout", height=height,
+        x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
+    )
+    planned_retract = None
+    if getattr(context.deck, "planning_enabled", False) is True:
+        from ..routing import prepared_step
+
+        planned_retract = prepared_step(context, "blowout").data.get("blowout_retract")
+    _blowout_and_retract(
+        context, pipette, tip_position, speed, retract_z, planned_retract,
+    )
 
 
-@protocol_command("mix")
+@protocol_command("pipette_home", summary=_summaries.pipette_home)
+def pipette_home(context: ProtocolContext) -> None:
+    """Return the pipette piston home at its current gantry position."""
+    _get_pipette(context).home()
+
+
+@protocol_command("mix", summary=_summaries.mix)
 def mix(
     context: ProtocolContext,
     position: str,
     volume_ul: float,
-    repetitions: int = 3,
+    cycles: int = 3,
     speed: float = 50.0,
     height: float = 0.0,
+    travel_clearance: PipetteTravelClearance = 3.0,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
+    blowout_height: float = 0.0,
 ) -> Any:
-    """Move pipette to *position*, then mix."""
+    """Mix at *height*, then blow out at *blowout_height* and reset safely."""
+    try:
+        validate_pipette_travel_clearance(travel_clearance)
+        _assert_finite_number(
+            blowout_height, field_name="blowout_height", source="command 'mix'",
+        )
+    except ValueError as exc:
+        raise ProtocolExecutionError(str(exc)) from exc
     tracked = _tracked_fluid_state(context)
     pipette = _get_pipette(context)
+    retract_z = _blowout_retract_z(context, pipette, position, blowout_height)
+    planned_retract = None
     operation_key = None
     if tracked:
         operation_key, should_execute = _begin_tracked_mix(
             context,
             position=position,
             volume_ul=volume_ul,
-            repetitions=repetitions,
+            cycles=cycles,
             speed=speed,
             height=height,
+            blowout_height=blowout_height,
         )
         if not should_execute:
             context.logger.info(
                 "Skipping already-applied fluid operation %s", operation_key,
             )
+            context.notify_step("step_skipped", reason=_ALREADY_APPLIED)
             return None
     try:
-        _engage(context, position, command_label="mix", height=height)
-        result = pipette.mix(volume_ul, repetitions, speed)
+        if getattr(context.deck, "planning_enabled", False) is True:
+            from ..routing import prepared_step
+
+            planned = prepared_step(context, "mix")
+            planned_retract = planned.data.get("blowout_retract")
+            if (retract_z is not None) != (planned_retract is not None):
+                raise ProtocolExecutionError("mix blowout requirements changed since preflight.")
+            context.routing_session.execute(planned.plans[0])
+            motion_index = 1
+            for _ in range(cycles):
+                pipette.aspirate(volume_ul, speed)
+                context.routing_session.execute(planned.plans[motion_index])
+                motion_index += 1
+                pipette.dispense(volume_ul, speed)
+                pipette.aspirate(volume_ul, speed)
+                context.routing_session.execute(planned.plans[motion_index])
+                motion_index += 1
+                pipette.dispense(volume_ul, speed)
+            finish_plan = planned.plans[motion_index]
+            context.routing_session.execute(finish_plan)
+            finish_tip = _planned_tip_position(context, finish_plan)
+            from cubos.instruments.pipette.models import MixResult
+
+            result = MixResult(success=True, volume_ul=volume_ul, cycles=cycles)
+        else:
+            tip = _engage(
+                context, position, command_label="mix", height=height,
+                x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
+            )
+            result = pipette.mix(
+                volume_ul, cycles, speed, gantry=context.gantry, position=tip,
+            )
+            finish_tip = (tip[0], tip[1], tip[2] - height + blowout_height)
+            context.gantry.move("pipette", finish_tip)
+        _blowout_and_retract(
+            context, pipette, finish_tip, speed, retract_z, planned_retract,
+        )
     except BaseException as exc:
         if operation_key is not None:
             _mark_transfer_uncertain(context, operation_key, exc)
@@ -386,11 +575,13 @@ def mix(
     return result
 
 
-@protocol_command("pick_up_tip")
+@protocol_command("pick_up_tip", summary=_summaries.pick_up_tip)
 def pick_up_tip(
     context: ProtocolContext,
     position: str,
     speed: float = 50.0,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> None:
     """Move pipette to *position*, then pick up a tip.
 
@@ -410,6 +601,12 @@ def pick_up_tip(
     definition before reruns.
     """
     pipette = _get_pipette(context)
+    planned = None
+    if getattr(context.deck, "planning_enabled", False) is True:
+        from ..routing import prepared_step
+
+        planned = prepared_step(context, "pick_up_tip")
+        position = planned.data["position"]
     try:
         rack, tip_id = resolve_tip_rack_slot(context.deck, position)
     except TipRackResolutionError as exc:
@@ -441,6 +638,7 @@ def pick_up_tip(
             context.logger.info(
                 "Skipping already-applied tip operation %s", operation_key,
             )
+            context.notify_step("step_skipped", reason=_ALREADY_APPLIED)
             return
         tip_id = resolved_tip_id
         position = f"{rack_key}.{tip_id}"
@@ -459,14 +657,27 @@ def pick_up_tip(
             )
 
     try:
-        _engage(context, position, command_label="pick_up_tip")
-        pipette.pick_up_tip(speed)
+        if planned is not None:
+            attach_after = int(planned.data["attach_after_plan"])
+            for plan in planned.plans[: attach_after + 1]:
+                context.routing_session.execute(plan)
+            pipette.pick_up_tip(speed)
+            pipette.set_attached_tip_extension(rack.tip_length)
+            rack.mark_tip_used(tip_id)
+            for plan in planned.plans[attach_after + 1:]:
+                context.routing_session.execute(plan)
+        else:
+            _engage(
+                context, position, command_label="pick_up_tip",
+                x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
+            )
+            pipette.pick_up_tip(speed)
+            pipette.set_attached_tip_extension(rack.tip_length)
+            rack.mark_tip_used(tip_id)
     except BaseException as exc:
         if operation_key is not None:
             _mark_tip_uncertain(context, operation_key, exc)
         raise
-    pipette.set_attached_tip_extension(rack.tip_length)
-    rack.mark_tip_used(tip_id)
     if operation_key is not None:
         try:
             context.data_store.complete_pick_up_tip(operation_key)
@@ -479,7 +690,7 @@ def pick_up_tip(
             ) from exc
 
 
-@protocol_command("transfer")
+@protocol_command("transfer", summary=_summaries.transfer)
 def transfer(
     context: ProtocolContext,
     source: str,
@@ -490,6 +701,11 @@ def transfer(
     destination_height: Optional[float] = None,
     liquid_class: Optional[str] = None,
     require_uncapped: Optional[List[str]] = None,
+    travel_clearance: PipetteTravelClearance = 3.0,
+    source_x_offset_mm: float = 0.0,
+    source_y_offset_mm: float = 0.0,
+    destination_x_offset_mm: float = 0.0,
+    destination_y_offset_mm: float = 0.0,
 ) -> None:
     """Aspirate from *source* and dispense into *destination*.
 
@@ -543,7 +759,19 @@ def transfer(
     volume, so tracked container state reflects what was asked for while
     hardware receives whatever correction is calibrated to actually deliver
     it.
+
+    Every transfer runs the pipette's calibrated blow-out motion once,
+    right after the *final* stroke's dispense -- clearing any fluid left in
+    the tip after the transfer is otherwise complete, rather than after
+    every stroke of a multi-stroke transfer. It does not change the
+    tracked dispense volume. Instruments requiring a piston reset retract
+    to ``safe_z`` first, then home. Blow-out, retract, and home failures
+    require reconciliation before the final stroke can be considered complete.
     """
+    try:
+        validate_pipette_travel_clearance(travel_clearance)
+    except ValueError as exc:
+        raise ProtocolExecutionError(str(exc)) from exc
     _require_uncapped(context, require_uncapped, command_label="transfer")
 
     tracked = _tracked_fluid_state(context)
@@ -660,6 +888,15 @@ def transfer(
     if resolved_destination_height is None:
         resolved_destination_height = 0.0
 
+    retract_z = _blowout_retract_z(
+        context, pipette, destination, resolved_destination_height,
+    )
+    planned = None
+    if getattr(context.deck, "planning_enabled", False) is True:
+        from ..routing import prepared_step
+
+        planned = prepared_step(context, "transfer")
+
     stroke_count = len(stroke_volumes)
     multi_stroke = stroke_count > 1
     previous_substep = context.active_substep
@@ -685,6 +922,15 @@ def transfer(
                 tracked=tracked,
                 stroke_index=stroke_index,
                 stroke_count=stroke_count,
+                planned_source=(planned.plans[2 * stroke_index] if planned else None),
+                planned_destination=(planned.plans[2 * stroke_index + 1] if planned else None),
+                blow_out=stroke_index == stroke_count - 1,
+                blowout_retract_z=retract_z,
+                planned_blowout_retract=(planned.data.get("blowout_retract") if planned else None),
+                source_x_offset_mm=source_x_offset_mm,
+                source_y_offset_mm=source_y_offset_mm,
+                destination_x_offset_mm=destination_x_offset_mm,
+                destination_y_offset_mm=destination_y_offset_mm,
             )
     finally:
         context.active_substep = previous_substep
@@ -706,6 +952,15 @@ def _execute_transfer_stroke(
     tracked: bool,
     stroke_index: int,
     stroke_count: int,
+    planned_source: Any = None,
+    planned_destination: Any = None,
+    blow_out: bool = False,
+    blowout_retract_z: float | None = None,
+    planned_blowout_retract: Any = None,
+    source_x_offset_mm: float = 0.0,
+    source_y_offset_mm: float = 0.0,
+    destination_x_offset_mm: float = 0.0,
+    destination_y_offset_mm: float = 0.0,
 ) -> None:
     """Journal, actuate, and commit exactly one transfer stroke.
 
@@ -713,6 +968,10 @@ def _execute_transfer_stroke(
     the resumability rationale). ``correction`` is applied only to the
     volume handed to the pipette driver; the durable state update always
     uses ``stroke_volume_ul`` (the requested, uncorrected amount).
+
+    ``blow_out`` fires the pipette's blow-out motion right after this
+    stroke's dispense -- callers pass this only for the final stroke of a
+    transfer (see ``transfer``'s docstring).
     """
     operation_key = None
     if tracked:
@@ -729,20 +988,41 @@ def _execute_transfer_stroke(
                 "Skipping already-applied fluid operation %s (stroke %d/%d)",
                 operation_key, stroke_index + 1, stroke_count,
             )
+            context.notify_step(
+                "step_skipped",
+                reason=(
+                    f"{_ALREADY_APPLIED} "
+                    f"(stroke {stroke_index + 1}/{stroke_count})"
+                ),
+            )
             return
 
     commanded_volume_ul = correction.apply(stroke_volume_ul)
     try:
-        _engage(
-            context, source, command_label="transfer.aspirate",
-            height=source_height,
-        )
+        if planned_source is None:
+            _engage(
+                context, source, command_label="transfer.aspirate",
+                height=source_height,
+                x_offset_mm=source_x_offset_mm, y_offset_mm=source_y_offset_mm,
+            )
+        else:
+            context.routing_session.execute(planned_source)
         pipette.aspirate(commanded_volume_ul, speed)
-        _engage(
-            context, destination, command_label="transfer.dispense",
-            height=destination_height,
-        )
+        if planned_destination is None:
+            destination_tip = _engage(
+                context, destination, command_label="transfer.dispense",
+                height=destination_height,
+                x_offset_mm=destination_x_offset_mm, y_offset_mm=destination_y_offset_mm,
+            )
+        else:
+            context.routing_session.execute(planned_destination)
+            destination_tip = _planned_tip_position(context, planned_destination)
         pipette.dispense(commanded_volume_ul, speed)
+        if blow_out:
+            _blowout_and_retract(
+                context, pipette, destination_tip, speed, blowout_retract_z,
+                planned_blowout_retract,
+            )
     except BaseException as exc:
         if operation_key is not None:
             _mark_transfer_stroke_uncertain(
@@ -769,11 +1049,13 @@ def _execute_transfer_stroke(
         _record_transfer_to_store(context, source, destination, stroke_volume_ul)
 
 
-@protocol_command("drop_tip")
+@protocol_command("drop_tip", summary=_summaries.drop_tip)
 def drop_tip(
     context: ProtocolContext,
     position: str,
     speed: float = 50.0,
+    x_offset_mm: float = 0.0,
+    y_offset_mm: float = 0.0,
 ) -> None:
     """Move pipette to *position*, then drop the tip.
 
@@ -804,16 +1086,31 @@ def drop_tip(
             context.logger.info(
                 "Skipping already-applied tip operation %s", operation_key,
             )
+            context.notify_step("step_skipped", reason=_ALREADY_APPLIED)
             return
 
+    planned = None
+    if getattr(context.deck, "planning_enabled", False) is True:
+        from ..routing import prepared_step
+
+        planned = prepared_step(context, "drop_tip")
+
     try:
-        _engage(context, position, command_label="drop_tip")
+        if planned is None:
+            _engage(
+                context, position, command_label="drop_tip",
+                x_offset_mm=x_offset_mm, y_offset_mm=y_offset_mm,
+            )
+        else:
+            context.routing_session.execute(planned.plans[0])
         pipette.drop_tip(speed)
+        pipette.clear_attached_tip_extension()
+        if planned is not None:
+            context.routing_session.execute(planned.plans[1])
     except BaseException as exc:
         if operation_key is not None:
             _mark_tip_uncertain(context, operation_key, exc)
         raise
-    pipette.clear_attached_tip_extension()
     if operation_key is not None:
         try:
             context.data_store.complete_drop_tip(operation_key)
@@ -850,7 +1147,86 @@ def _wells_for_axis(plate: WellPlate, axis: str) -> list:
     return sorted(wells, key=lambda w: (w[0], int(w[1:])))
 
 
-@protocol_command("serial_transfer")
+@protocol_command("multi_dispense", summary=_summaries.multi_dispense)
+def multi_dispense(
+    context: ProtocolContext,
+    source: str,
+    destinations: list[str],
+    volumes: list[StrictFloat],
+    speed: StrictFloat = 50.0,
+    source_height: StrictFloat = 0.0,
+    destination_height: StrictFloat = 0.0,
+) -> None:
+    """Aspirate the sum once, then dispense each portion in destination order."""
+    planned = None
+    if getattr(context.deck, "planning_enabled", False) is True:
+        from ..routing import prepared_step
+
+        planned = prepared_step(context, "multi_dispense")
+        if planned.data["arguments"] != (
+            source, tuple(destinations), tuple(volumes), speed, source_height, destination_height,
+        ):
+            raise ProtocolExecutionError("multi_dispense arguments differ from the preflighted plan.")
+    if _tracked_fluid_state(context):
+        raise ProtocolExecutionError(
+            "multi_dispense is disabled while durable fluid tracking is active: "
+            "the journal cannot track liquid held between destinations. "
+            "Use transfer or serial_transfer."
+        )
+    pipette = _get_pipette(context)
+    try:
+        total = plan_multi_dispense(destinations, volumes, pipette_capacity(pipette))
+        for name, value in (
+            ("speed", speed), ("source_height", source_height),
+            ("destination_height", destination_height),
+        ):
+            _assert_finite_number(value, field_name=name, source="multi_dispense")
+        if not 0 <= speed <= 100:
+            raise ValueError("multi_dispense speed must be between 0 and 100.")
+        for position in [source, *destinations]:
+            context.deck.resolve_coordinate(position)
+    except (KeyError, ValueError) as exc:
+        raise ProtocolExecutionError(f"multi_dispense preflight failed: {exc}") from exc
+    loaded = pipette.loaded_volume_ul
+    if (
+        isinstance(loaded, bool) or not isinstance(loaded, (int, float))
+        or not math.isfinite(loaded) or abs(loaded) > 1e-6
+    ):
+        raise ProtocolExecutionError(
+            "multi_dispense requires a known empty pipette. "
+            "Resolve any remaining or uncertain liquid before starting a batch."
+        )
+
+    retract_z = _blowout_retract_z(context, pipette, destinations[-1], destination_height)
+    if planned is None:
+        _engage(context, source, command_label="multi_dispense.aspirate", height=source_height)
+    else:
+        if (retract_z is not None) != (planned.data.get("blowout_retract") is not None):
+            raise ProtocolExecutionError("multi_dispense blowout requirements changed since preflight.")
+        context.routing_session.execute(planned.plans[0])
+    result = pipette.aspirate(total, speed)
+    if not result.success:
+        raise ProtocolExecutionError("multi_dispense aspiration did not succeed.")
+    for i, (destination, volume) in enumerate(zip(destinations, volumes), start=1):
+        if planned is None:
+            destination_tip = _engage(
+                context, destination, command_label="multi_dispense.dispense",
+                height=destination_height,
+            )
+        else:
+            context.routing_session.execute(planned.plans[i])
+            destination_tip = _planned_tip_position(context, planned.plans[i])
+        result = pipette.dispense(volume, speed)
+        if not result.success:
+            raise ProtocolExecutionError("multi_dispense dispense did not succeed.")
+        _record_transfer_to_store(context, source, destination, volume)
+    _blowout_and_retract(
+        context, pipette, destination_tip, speed, retract_z,
+        planned.data.get("blowout_retract") if planned else None,
+    )
+
+
+@protocol_command("serial_transfer", summary=_summaries.serial_transfer)
 def serial_transfer(
     context: ProtocolContext,
     source: str,
@@ -861,6 +1237,10 @@ def serial_transfer(
     speed: float = 50.0,
     source_height: float = 0.0,
     destination_height: float = 0.0,
+    source_x_offset_mm: float = 0.0,
+    source_y_offset_mm: float = 0.0,
+    destination_x_offset_mm: float = 0.0,
+    destination_y_offset_mm: float = 0.0,
 ) -> None:
     """Transfer from *source* to each well along a row or column.
 
@@ -908,7 +1288,11 @@ def serial_transfer(
             context.active_substep = f"{index}:{destination}"
             transfer(context, source=source, destination=destination,
                      volume_ul=vol, speed=speed, source_height=source_height,
-                     destination_height=destination_height)
+                     destination_height=destination_height,
+                     source_x_offset_mm=source_x_offset_mm,
+                     source_y_offset_mm=source_y_offset_mm,
+                     destination_x_offset_mm=destination_x_offset_mm,
+                     destination_y_offset_mm=destination_y_offset_mm)
     finally:
         context.active_substep = previous_substep
 
@@ -934,8 +1318,21 @@ def _substep_scope(context: ProtocolContext, suffix: str) -> Iterator[None]:
     """
     previous = context.active_substep
     context.active_substep = f"{previous}:{suffix}" if previous else suffix
+    started = time.monotonic()
+    context.notify_step("step_started")
     try:
         yield
+    except BaseException as exc:
+        context.notify_step(
+            "step_failed",
+            duration_s=time.monotonic() - started,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    else:
+        context.notify_step(
+            "step_completed", duration_s=time.monotonic() - started,
+        )
     finally:
         context.active_substep = previous
 
@@ -989,6 +1386,7 @@ def _transfer_or_skip(context: ProtocolContext, **kwargs: Any) -> None:
     skip.
     """
     if _leg_already_applied(context):
+        context.notify_step("step_skipped", reason=_ALREADY_APPLIED)
         context.logger.info(
             "Skipping already-applied fluid operation %s",
             context.fluid_operation_key("transfer"),
@@ -1102,7 +1500,7 @@ def _resolve_waste_target(
     return position
 
 
-@protocol_command("rinse_well")
+@protocol_command("rinse_well", summary=_summaries.rinse_well)
 def rinse_well(
     context: ProtocolContext,
     well: str,
@@ -1158,7 +1556,7 @@ def rinse_well(
             with _substep_scope(context, f"{cycle_scope}:mix"):
                 mix(
                     context, well, mix_volume_ul or volume_ul,
-                    repetitions=mix_repetitions, speed=speed,
+                    cycles=mix_repetitions, speed=speed,
                     height=well_height or 0.0,
                 )
         resolved_waste = _resolve_waste_target(
@@ -1173,7 +1571,7 @@ def rinse_well(
             )
 
 
-@protocol_command("flush_pipette")
+@protocol_command("flush_pipette", summary=_summaries.flush_pipette)
 def flush_pipette(
     context: ProtocolContext,
     volume_ul: float,
@@ -1217,7 +1615,7 @@ def flush_pipette(
             )
 
 
-@protocol_command("purge_pipette")
+@protocol_command("purge_pipette", summary=_summaries.purge_pipette)
 def purge_pipette(
     context: ProtocolContext,
     volume_ul: float,
@@ -1264,7 +1662,7 @@ def purge_pipette(
         )
 
 
-@protocol_command("clear_well")
+@protocol_command("clear_well", summary=_summaries.clear_well)
 def clear_well(
     context: ProtocolContext,
     well: str,

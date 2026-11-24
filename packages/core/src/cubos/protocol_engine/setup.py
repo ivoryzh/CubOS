@@ -14,6 +14,7 @@ import yaml
 
 from cubos.deck.deck import Deck
 from cubos.deck.loader import load_deck_from_yaml_safe
+from cubos.deck.tip_presence import apply_durable_tip_status
 from cubos.gantry.errors import GantryLoaderError
 from cubos.gantry.gantry import Gantry
 from cubos.gantry.gantry_config import GantryConfig
@@ -52,6 +53,8 @@ def setup_protocol(
     data_store: Any | None = None,
     campaign_id: int | None = None,
     fluid_state_id: int | None = None,
+    step_observer: Any | None = None,
+    defer_position_dependent_planning: bool = False,
 ) -> Tuple[Protocol, ProtocolContext]:
     """Load all configs, validate bounds, and return a ready-to-run protocol.
 
@@ -74,6 +77,9 @@ def setup_protocol(
         data_store: Optional persistence store attached to the runtime context.
         campaign_id: Optional campaign ID used with ``data_store``.
         fluid_state_id: Optional durable deck-bound fluid-state session ID.
+        step_observer: Optional :class:`~cubos.protocol_engine.observer.
+            StepObserver` notified as each step and substep runs. Advisory
+            only -- observer errors are swallowed and never affect the run.
 
     Returns:
         Tuple of (Protocol, ProtocolContext) ready for ``protocol.execute(context)``.
@@ -94,6 +100,9 @@ def setup_protocol(
         deck_path,
         factory_z_travel_mm=gantry_config.factory_z_travel_mm,
     )
+    snapshot_reader = getattr(data_store, "get_tip_snapshot", None)
+    if deck.planning_enabled and fluid_state_id is not None and callable(snapshot_reader):
+        apply_durable_tip_status(deck, snapshot_reader(fluid_state_id))
 
     if gantry is None:
         gantry = Gantry(offline=True)
@@ -115,7 +124,7 @@ def setup_protocol(
         )
 
     if protocol is None:
-        protocol = load_protocol_from_yaml_safe(protocol_path)
+        protocol = load_protocol_from_yaml_safe(protocol_path, deck=deck)
 
     violations = validate_protocol_motion_bounds(
         gantry_config, protocol, deck, instrumented_gantry,
@@ -137,7 +146,17 @@ def setup_protocol(
         data_store=data_store,
         campaign_id=campaign_id,
         fluid_state_id=fluid_state_id,
+        step_observer=step_observer,
     )
+    if getattr(deck, "planning_enabled", False) is True:
+        from .routing import prepare_planning_context, validate_planning_configuration
+
+        validate_planning_configuration(protocol, context)
+        if not defer_position_dependent_planning:
+            if getattr(gantry, "_offline", False) is True:
+                volume = gantry_config.working_volume
+                gantry.move_to(volume.x_max, volume.y_max, volume.z_max)
+            prepare_planning_context(protocol, context)
     return protocol, context
 
 
@@ -251,6 +270,7 @@ def run_on_hardware(
             gantry=gantry, mock_mode=mock_mode,
             data_store=data_store, campaign_id=campaign_id,
             fluid_state_id=fluid_state_id,
+            defer_position_dependent_planning=True,
         )
         if fluid_state_id is not None:
             fluid_state_id = data_store.resume_fluid_state(
@@ -303,7 +323,19 @@ def run_on_hardware(
         context.campaign_id = campaign_id
         context.fluid_state_id = fluid_state_id
         gantry.connect()
-        gantry.prepare_for_protocol_run()
+        planning_enabled = getattr(context.deck, "planning_enabled", False) is True
+        if planning_enabled:
+            status = gantry.get_status()
+            if status != "Idle" and not status.startswith("<Idle|"):
+                raise GantryHealthCheckError(
+                    "Planning-enabled execution requires an Idle controller before "
+                    f"preflight; observed {status!r}. No motion was attempted."
+                )
+            from .routing import prepare_planning_context
+
+            prepare_planning_context(protocol, context)
+        else:
+            gantry.prepare_for_protocol_run()
         context.gantry.connect_instruments()
         if not gantry.is_healthy():
             raise GantryHealthCheckError(
@@ -320,7 +352,7 @@ def run_on_hardware(
     finally:
         try:
             if context is not None:
-                if run_failed:
+                if run_failed and getattr(context.deck, "planning_enabled", False) is not True:
                     _best_effort_retract_to_safe_z(context)
                 try:
                     context.gantry.disconnect_instruments()

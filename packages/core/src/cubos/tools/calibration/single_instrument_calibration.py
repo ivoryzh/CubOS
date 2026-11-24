@@ -582,11 +582,6 @@ def _print_config_patch(
         reach_name = instrument_name or "reference_tcp"
         output("")
         output(f"  {reach_name}_reachable_z_min: {reachable_z_min_mm:.3f} mm")
-        output(
-            "For a future multi-instrument config, keep one shared deck frame "
-            "and encode this as a per-instrument lower-reach limit instead of "
-            "using one global z_min for every tool."
-        )
 
 
 def _print_dry_run(
@@ -610,11 +605,6 @@ def _print_dry_run(
     )
     for command in commands:
         output(f"  {command}")
-    output("")
-    output(
-        "The gantry YAML cnc.factory_z_travel_mm is preserved as an out-of-box "
-        "safety bound; calibrated Z max comes from the homed readback."
-    )
 
 
 def _commands_for_z_min(
@@ -810,11 +800,8 @@ def _temporarily_disable_soft_limits_for_origin_jog(
     enabled = _read_soft_limits_enabled_if_available(gantry, output=output)
     if enabled is not True:
         return False
-    output(
-        "Temporarily disabling GRBL soft limits ($20=0) for the interactive "
-        "origin jog so stale travel settings cannot block calibration."
-    )
-    output("Jog cautiously; this does not change the hard-limit setting.")
+    output("Temporarily disabling GRBL soft limits ($20=0) for this jog.")
+    output("Jog cautiously.")
     if not _set_soft_limits_enabled_if_available(gantry, False):
         output("No GRBL setting writer is available; leaving soft limits unchanged.")
         return False
@@ -831,6 +818,70 @@ def _restore_soft_limits_after_origin_jog(
         raise MillConnectionError(
             "Cannot restore GRBL soft limits because this gantry object has no "
             "setting writer."
+        )
+
+
+def _read_hard_limits_enabled_if_available(
+    gantry: Gantry,
+    *,
+    output: Callable[[str], None],
+) -> bool | None:
+    reader = getattr(gantry, "hard_limits_enabled", None)
+    if not callable(reader):
+        return None
+    try:
+        return reader()
+    except MillConnectionError:
+        raise
+    except (CommandExecutionError, StatusReturnError, ValueError) as exc:
+        output(f"Could not read GRBL hard-limit state before jogging: {exc}")
+        output("Continuing without hard-limit enforcement for this jog.")
+        return None
+
+
+def _set_hard_limits_enabled_if_available(
+    gantry: Gantry,
+    enabled: bool,
+) -> bool:
+    setter = getattr(gantry, "set_hard_limits_enabled", None)
+    if not callable(setter):
+        return False
+    setter(enabled)
+    return True
+
+
+def _temporarily_enable_hard_limits_for_origin_jog(
+    gantry: Gantry,
+    *,
+    output: Callable[[str], None],
+) -> bool:
+    """Enable $21 for the origin jog when the controller has it off.
+
+    With soft limits disabled above, hard limits are the only motion
+    backstop — without them a jog past a travel end grinds and silently
+    skips steps, corrupting the calibration being taken. Returns True when
+    $21 was flipped on (the caller must restore it afterwards).
+    """
+    enabled = _read_hard_limits_enabled_if_available(gantry, output=output)
+    if enabled is not False:
+        return False
+    output("Enabling GRBL hard limits ($21=1) for this jog.")
+    if not _set_hard_limits_enabled_if_available(gantry, True):
+        output("No GRBL setting writer is available; leaving hard limits unchanged.")
+        return False
+    return True
+
+
+def _restore_hard_limits_after_origin_jog(
+    gantry: Gantry,
+    *,
+    output: Callable[[str], None],
+) -> None:
+    output("Restoring pre-calibration GRBL hard limits ($21=0) after origin jog.")
+    if not _set_hard_limits_enabled_if_available(gantry, False):
+        output(
+            "Could not restore $21=0 (no setting writer); hard limits stay "
+            "enabled — the safer state."
         )
 
 
@@ -1126,6 +1177,7 @@ def run_calibration(
     gantry_runtime_config.pop("grbl_settings", None)
     gantry = gantry_factory(config=gantry_runtime_config)
     restore_soft_limits_after_origin_jog = False
+    restore_hard_limits_after_origin_jog = False
     try:
         output("Connecting to gantry...")
         gantry.connect()
@@ -1153,6 +1205,12 @@ def run_calibration(
                 output=output,
             )
         )
+        restore_hard_limits_after_origin_jog = (
+            _temporarily_enable_hard_limits_for_origin_jog(
+                gantry,
+                output=output,
+            )
+        )
         try:
             _interactive_jog_to_xy_origin(
                 gantry,
@@ -1166,9 +1224,13 @@ def run_calibration(
                 origin_policy=origin_policy.value,
             )
         finally:
+            # Re-enable soft limits before dropping the hard-limit backstop.
             if restore_soft_limits_after_origin_jog:
                 restore_soft_limits_after_origin_jog = False
                 _restore_soft_limits_after_origin_jog(gantry, output=output)
+            if restore_hard_limits_after_origin_jog:
+                restore_hard_limits_after_origin_jog = False
+                _restore_hard_limits_after_origin_jog(gantry, output=output)
 
         output("Setting current physical pose to WPos X=0, Y=0...")
         gantry.set_work_coordinates(x=0.0, y=0.0)
@@ -1375,7 +1437,12 @@ def run_calibration(
                 restore_soft_limits_after_origin_jog = False
                 _restore_soft_limits_after_origin_jog(gantry, output=output)
         finally:
-            _cancel_jog_if_available(gantry, output=output)
-            _set_serial_timeout_if_available(gantry, 0.05)
-            output("Disconnecting...")
-            gantry.disconnect()
+            try:
+                if restore_hard_limits_after_origin_jog:
+                    restore_hard_limits_after_origin_jog = False
+                    _restore_hard_limits_after_origin_jog(gantry, output=output)
+            finally:
+                _cancel_jog_if_available(gantry, output=output)
+                _set_serial_timeout_if_available(gantry, 0.05)
+                output("Disconnecting...")
+                gantry.disconnect()

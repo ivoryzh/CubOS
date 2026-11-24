@@ -1,26 +1,23 @@
 # Getting Started
 
-This guide gets CubOS installed and points you to the right setup path. First
-time users should follow the YAML workflow: one gantry file, one deck file, and
-one protocol file.
+**CubOS already installed?** Open it and follow [Use CubOS Operator](operator-ui.md).
+You do not need to install developer tools or edit YAML files to use the app.
 
-## Setup Path
+## Choose Your Setup Path
 
-1. Install CubOS.
-2. If you are building your own machine, complete
-   [Gantry Bring-Up](admin/gantry-bring-up.md).
-3. Create your gantry YAML from the right seed config and define your
-   mounted instruments with [Set Up Gantry YAML](gantry-setup.md).
-4. Calibrate the gantry with [Calibrate Gantry](calibration.md).
-5. Place labware and define deck YAML with [Set Up Deck and Labware](deck.md).
-6. Validate and run a protocol with
-   [Run a Protocol with YAML](protocol-yaml.md).
-7. If something goes wrong along the way, see
-   [Troubleshooting & Recovery](troubleshooting.md).
+| Your setup | Start here |
+|---|---|
+| Windows installer supplied by your lab | Run the installer, then open **CubOS** from the desktop or Start menu. Python, Node.js, and Git are bundled or unnecessary on this computer. |
+| Preinstalled CubOS appliance | Use the address your administrator supplied and follow the [Operator guide](operator-ui.md). |
+| Installing from the source repository | Follow the installation steps below. Operator needs **Python 3.11+** and a compatible Node.js version to build the browser interface. |
+| Building your own machine | Complete [Gantry Bring-Up](admin/gantry-bring-up.md), then follow the [Operator setup sequence](operator-ui.md#your-first-run). |
+| Working from the terminal | Set up [gantry YAML](gantry-setup.md), [calibration](calibration.md), [deck YAML](deck.md), and [protocol YAML](protocol-yaml.md). |
+
+The remaining instructions are for **installing from source**.
 
 ## Prerequisites
 
-CubOS needs Python 3.10+ and Git installed first. **All shell commands
+Use Python 3.11+ and Git for CubOS Operator (the core package alone supports Python 3.10+). **All shell commands
 elsewhere in these docs assume a Unix-like shell.** On Windows, install
 [Git for Windows](https://git-scm.com/download/win) (it bundles **Git
 Bash**) and run every command in these docs from a Git Bash window — or
@@ -31,7 +28,7 @@ Windows, both are shown below.
 
 - Install [Git for Windows](https://git-scm.com/download/win). Use the Git
   Bash it installs for the commands in these docs.
-- Install [Python 3.10 or newer](https://www.python.org/downloads/windows/).
+- Install [Python 3.11 or newer](https://www.python.org/downloads/windows/).
   During setup, check "Add python.exe to PATH".
 - Verify, from Git Bash or PowerShell:
   ```bash
@@ -49,7 +46,7 @@ Windows, both are shown below.
 
 ### Linux
 
-- Install Python 3.10+ and Git with your distro's package manager, e.g. on
+- Install Python 3.11+ and Git with your distro's package manager, e.g. on
   Debian/Ubuntu:
   ```bash
   sudo apt install python3 python3-venv python3-pip git
@@ -102,7 +99,61 @@ the version numbers shown in the notice.
 ```bash
 python -m pip install --upgrade pip
 python -m pip install -e "packages/core[dev]"
+python -m pip install -e services/api
 ```
+
+The first install is the CubOS runtime (`cubos`); the second is the
+`cubos_api` server that powers the [Operator UI](operator-ui.md). If you
+plan to work only from the terminal with YAML files, the `services/api`
+install is optional — but it is required before `python -m cubos_api` will
+work. Note that `services/api` needs Python 3.11+ (the core package alone
+works on 3.10).
+
+!!! note "Every new terminal: activate the venv first"
+    Everything above installs into `.venv`, so `python -m cubos_api` — and
+    every other `python -m cubos...` command in these docs — only works
+    while the virtual environment is active. Activation does not persist:
+    each new terminal window starts without it. If a command fails with
+    `No module named cubos_api` (or `No module named cubos`), re-run the
+    activation command for your platform from
+    [Installation](#installation) above — you never need to reinstall.
+
+### Build the Operator UI (browser app)
+
+The `cubos_api` server serves the Operator UI's compiled web assets from
+`apps/operator-web/dist/`. That folder is not checked into the repository —
+build it once with Node.js:
+
+1. Install [Node.js 22.12+ (or 20.19+)](https://nodejs.org) (it includes
+   `npm`).
+2. From the repository root:
+
+   ```bash
+   cd apps/operator-web
+   npm ci
+   npm run build
+   cd ../..
+   ```
+
+Skip this if you work only from the terminal. If you start
+`python -m cubos_api` without building, the server still runs (the HTTP API
+works), but it logs `compiled web assets were not found` and the browser
+shows **404 Not Found** at `http://127.0.0.1:8742`. After building, start
+`python -m cubos_api` again — the server only looks for the assets at
+startup. Re-run `npm run build` whenever you pull changes that touch
+`apps/operator-web/`.
+
+### Start the Operator UI
+
+With the virtual environment active, run from the repository root:
+
+```bash
+python -m cubos_api
+```
+
+Your browser opens at `http://127.0.0.1:8742` after a moment; leave the
+terminal running. See [Use the Operator UI](operator-ui.md) for connecting
+to the gantry and everything else you can do from the browser.
 
 ### Instrument extras
 
@@ -112,10 +163,13 @@ you actually use. The extras currently defined in
 
 | Extra | Installs | For |
 |---|---|---|
-| `dev` | `pytest` | Running the test suite |
+| `dev` | `pytest`, `pytest-cov`, `diff-cover` | Core tests and coverage checks |
 | `docs` | `mkdocs`, `mkdocs-gen-files`, `mkdocstrings[python]`, `pymdown-extensions` | Building this documentation site |
 | `asmi-vernier` (alias `asmi`) | `godirect` | Vernier Go Direct force sensor (ASMI instrument) |
-| `potentiostat-admiral` (alias `potentiostat`) | `SquidstatPyLibrary` | Admiral Instruments SquidStat potentiostat |
+| `potentiostat-admiral` | `SquidstatPyLibrary` | Admiral Instruments SquidStat potentiostat |
+| `potentiostat-emstat` | Pinned Git build of `hardpotato` | EmStat potentiostat; EmStat4 LR also needs the external patch described in `packages/core/pyproject.toml` |
+| `potentiostat` | Both potentiostat dependencies above | Install both vendor integrations |
+| `camera` | `opencv-python`, `numpy`, `harvesters` | OpenCV webcams and FLIR image saving/GenTL support |
 
 For example, to work on an ASMI setup:
 
@@ -123,9 +177,12 @@ For example, to work on an ASMI setup:
 python -m pip install -e "packages/core[asmi-vernier]"
 ```
 
-Instrument types without a dedicated extra (`filmetrics`, `pipette`,
-`uv_curing`, `uvvis_ccs`, `camera`) don't require an extra vendor SDK install
-beyond CubOS's base dependencies.
+An extra does not install every native vendor dependency. FLIR's PySpin
+backend needs the Spinnaker SDK, its GenTL backend needs a compatible GenTL
+producer, and the Thorlabs CCS driver needs the TLCCS library. Check the
+[instrument configuration guide](gantry-setup.md#define-instruments) and your chosen
+driver's requirements before a hardware run. Offline validation does not
+verify those dependencies or device connectivity.
 
 Customer/proprietary instruments ship as normal Python packages — install the
 package with `python -m pip install`, and its instruments become available in

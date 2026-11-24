@@ -128,6 +128,17 @@ class TestGantryConfig:
         )
         assert config.gantry_type == GantryType.CUB_XL
 
+    def test_genmitsu_4040_pro_max_string_is_normalized_to_enum(self):
+        config = GantryConfig(
+            serial_port="/dev/ttyUSB0",
+            gantry_type="genmitsu_4040_pro_max",
+            factory_z_travel_mm=80.0,
+            working_volume=_make_volume(
+                x_max=390.0, y_max=390.0, z_max=70.0,
+            ),
+        )
+        assert config.gantry_type == GantryType.GENMITSU_4040_PRO_MAX
+
     def test_rejects_unknown_gantry_type(self):
         with pytest.raises(ValueError, match="gantry_type"):
             GantryConfig(
@@ -176,6 +187,45 @@ class TestGantryConfig:
                 factory_z_travel_mm=90.0,
                 working_volume=_make_volume(z_min=0.0, z_max=80.0),
                 safe_z=85.0,
+            )
+
+    def test_default_feed_rate_mm_min_defaults_to_none(self):
+        config = GantryConfig(
+            serial_port="/dev/ttyUSB0",
+            gantry_type=GantryType.CUB_XL,
+            factory_z_travel_mm=90.0,
+            working_volume=_make_volume(),
+        )
+        assert config.default_feed_rate_mm_min is None
+
+    def test_stores_default_feed_rate_mm_min(self):
+        config = GantryConfig(
+            serial_port="/dev/ttyUSB0",
+            gantry_type=GantryType.CUB_XL,
+            factory_z_travel_mm=90.0,
+            working_volume=_make_volume(),
+            default_feed_rate_mm_min=4000.0,
+        )
+        assert config.default_feed_rate_mm_min == 4000.0
+
+    def test_rejects_zero_default_feed_rate_mm_min(self):
+        with pytest.raises(ValueError, match="default_feed_rate_mm_min"):
+            GantryConfig(
+                serial_port="/dev/ttyUSB0",
+                gantry_type=GantryType.CUB_XL,
+                factory_z_travel_mm=90.0,
+                working_volume=_make_volume(),
+                default_feed_rate_mm_min=0.0,
+            )
+
+    def test_rejects_negative_default_feed_rate_mm_min(self):
+        with pytest.raises(ValueError, match="default_feed_rate_mm_min"):
+            GantryConfig(
+                serial_port="/dev/ttyUSB0",
+                gantry_type=GantryType.CUB_XL,
+                factory_z_travel_mm=90.0,
+                working_volume=_make_volume(),
+                default_feed_rate_mm_min=-100.0,
             )
 
 

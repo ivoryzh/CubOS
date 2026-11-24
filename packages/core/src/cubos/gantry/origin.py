@@ -4,8 +4,10 @@ CubOS gantry configs select one of two coordinate frames via
 ``GantryConfig.origin_policy``:
 
 * ``deck_origin`` (default): WPos zero at the front-left-bottom deck
-  corner; +X operator-right, +Y back, +Z up. The reachable working volume
-  is non-negative (``x_min == 0``, ``y_min == 0``, ``z_min >= 0``).
+  corner; +X operator-right, +Y back, +Z up. X/Y minima may be negative
+  when the machine can safely travel beyond the deck corner, while the
+  deck origin itself must remain reachable (``x_min <= 0``,
+  ``y_min <= 0``, ``z_min >= 0``).
 * ``home_origin``: WPos zero at the homed back-right-top corner. The
   reachable working volume is non-positive (``x_max == 0``, ``y_max == 0``,
   ``z_max <= 0``), mirror-symmetric with ``deck_origin``.
@@ -148,20 +150,19 @@ def format_set_work_position_command(
 def validate_deck_origin_minima(config: GantryConfig) -> None:
     """Validate that a gantry config is in the deck-origin frame shape."""
     volume = config.working_volume
-    non_zero_xy_mins = [
+    positive_xy_mins = [
         (axis, value)
         for axis, value in (
             ("x_min", volume.x_min),
             ("y_min", volume.y_min),
         )
-        if abs(value) > _ZERO_TOLERANCE
+        if value > _ZERO_TOLERANCE
     ]
-    if non_zero_xy_mins:
-        formatted = ", ".join(f"{axis}={value}" for axis, value in non_zero_xy_mins)
+    if positive_xy_mins:
+        formatted = ", ".join(f"{axis}={value}" for axis, value in positive_xy_mins)
         raise ValueError(
-            "Deck-origin calibration requires working_volume X/Y minima at 0.0; "
-            f"got {formatted}. Use a deck-origin gantry config before setting "
-            "front-left-bottom origin."
+            "Deck-origin calibration requires working_volume X/Y minima at or "
+            f"below 0.0 so the deck origin remains reachable; got {formatted}."
         )
     if volume.z_min < -_ZERO_TOLERANCE:
         raise ValueError(
@@ -264,3 +265,44 @@ def build_deck_origin_calibration_plan(
         origin_wpos=(0.0, 0.0, 0.0),
         commands=_CALIBRATION_COMMAND_SKELETON,
     )
+
+
+def calibrated_origin_frame(
+    origin_policy: str,
+    measured_volume: dict[str, float],
+    *,
+    z_min: float,
+    z_max: float,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Return signed bounds and homed WPos from positive calibration measurements."""
+    policy = OriginPolicy(origin_policy)
+    x, y = float(measured_volume["x"]), float(measured_volume["y"])
+    z_min, z_max = float(z_min), float(z_max)
+    if not all(math.isfinite(value) for value in (x, y, z_min, z_max)):
+        raise ValueError("Calibrated origin measurements must be finite.")
+    if x <= 0 or y <= 0 or z_min < 0 or z_max <= z_min:
+        raise ValueError("Calibrated origin measurements require positive usable spans.")
+    if policy is OriginPolicy.HOME_ORIGIN:
+        volume = {"x_min": -_round_mm(x), "x_max": 0.0, "y_min": -_round_mm(y), "y_max": 0.0, "z_min": -_round_mm(z_max - z_min), "z_max": 0.0}
+        position = {"x": 0.0, "y": 0.0, "z": 0.0}
+    else:
+        volume = {"x_min": 0.0, "x_max": _round_mm(x), "y_min": 0.0, "y_max": _round_mm(y), "z_min": _round_mm(z_min), "z_max": _round_mm(z_max)}
+        position = {"x": _round_mm(x), "y": _round_mm(y), "z": _round_mm(z_max)}
+    return volume, position
+
+
+def translate_calibrated_safe_z(
+    safe_z: float | None,
+    previous_policy: str,
+    selected_policy: str,
+    homed_z: float,
+    working_volume: dict[str, float],
+) -> float:
+    """Keep the same physical travel plane when changing the origin policy."""
+    previous, selected = OriginPolicy(previous_policy), OriginPolicy(selected_policy)
+    value = working_volume["z_max"] if safe_z is None else float(safe_z)
+    if not all(math.isfinite(float(number)) for number in (value, homed_z)):
+        raise ValueError("Safe travel Z and homed Z must be finite.")
+    if safe_z is not None and previous is not selected:
+        value += homed_z if selected is OriginPolicy.DECK_ORIGIN else -homed_z
+    return _round_mm(min(max(value, working_volume["z_min"]), working_volume["z_max"]))
